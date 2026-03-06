@@ -30,6 +30,7 @@ import argparse
 import ctypes
 import ctypes.util
 import fcntl
+import json
 import logging
 import os
 import pty
@@ -43,6 +44,7 @@ import termios
 import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, Tuple
 
 # Linux-Konstanten fuer serielle DCD-Abfrage
@@ -646,6 +648,155 @@ class NmeaGenerator:
 
 
 # ---------------------------------------------------------------------------
+# Bridge-Status (thread-sicher, fuer Web-Interface)
+# ---------------------------------------------------------------------------
+
+class BridgeStatus:
+    """Thread-sichere Statusablage fuer das Web-Interface."""
+
+    def __init__(self, pps_source_cfg: str):
+        self._lock = threading.Lock()
+        self._data = {
+            'connected':    False,
+            'gps_locked':   False,
+            'num_sats':     0,
+            'prns':         [],
+            'lat':          None,
+            'lon':          None,
+            'alt':          None,
+            'last_gps_time': None,   # ISO-String
+            'last_pps_time': None,   # ISO-String
+            'tfom':         '',
+            'pps_source':   pps_source_cfg,
+            'started_at':   datetime.now(timezone.utc).isoformat(),
+        }
+
+    def update(self, **kwargs):
+        with self._lock:
+            self._data.update(kwargs)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._data)
+
+
+# ---------------------------------------------------------------------------
+# Web-Interface
+# ---------------------------------------------------------------------------
+
+_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>UCCM GPS Bridge</title>
+<style>
+  body {{ font-family: monospace; background: #111; color: #ccc; margin: 2em; }}
+  h1   {{ color: #0af; }}
+  table {{ border-collapse: collapse; margin-top: 1em; }}
+  td, th {{ padding: 0.3em 1.2em 0.3em 0; text-align: left; }}
+  th   {{ color: #888; font-weight: normal; }}
+  .ok  {{ color: #4c4; }}
+  .err {{ color: #e44; }}
+  .warn{{ color: #fa0; }}
+  #ts  {{ color: #555; font-size: 0.85em; margin-top: 1.5em; }}
+</style>
+</head>
+<body>
+<h1>Samsung UCCM GPS Bridge</h1>
+<table id="tbl"><tr><td>Lade ...</td></tr></table>
+<div id="ts"></div>
+<script>
+function cls(v, ok, warn) {{
+  if (v === null || v === undefined) return 'warn';
+  if (ok  !== undefined && v === ok)   return 'ok';
+  if (warn !== undefined && v === warn) return 'warn';
+  return 'err';
+}}
+function fmt(v) {{ return v === null || v === '' ? '–' : v; }}
+async function refresh() {{
+  try {{
+    const r = await fetch('/status');
+    const d = await r.json();
+    const rows = [
+      ['Verbindung',   d.connected   ? '<span class="ok">Verbunden</span>' : '<span class="err">Getrennt</span>'],
+      ['GPS Lock',     d.gps_locked  ? '<span class="ok">Locked</span>'    : '<span class="err">Unlocked</span>'],
+      ['GPS-Zeit',     fmt(d.last_gps_time)],
+      ['Position',     d.lat !== null ? `${{d.lat.toFixed(6)}} / ${{d.lon.toFixed(6)}} / ${{d.alt.toFixed(1)}} m` : '–'],
+      ['Satelliten',   d.num_sats + (d.prns.length ? ' (PRNs: ' + d.prns.join(', ') + ')' : '')],
+      ['TFOM',         fmt(d.tfom)],
+      ['1PPS-Quelle',  fmt(d.pps_source)],
+      ['Letzter PPS',  fmt(d.last_pps_time)],
+      ['Bridge-Start', fmt(d.started_at)],
+    ];
+    document.getElementById('tbl').innerHTML =
+      rows.map(([k, v]) => `<tr><th>${{k}}</th><td>${{v}}</td></tr>`).join('');
+    document.getElementById('ts').textContent =
+      'Aktualisiert: ' + new Date().toISOString();
+  }} catch(e) {{
+    document.getElementById('ts').textContent = 'Fehler: ' + e;
+  }}
+}}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+class _WebHandler(BaseHTTPRequestHandler):
+    """HTTP-Handler fuer Bridge-Status."""
+
+    # Bridge-Status wird als Klassenattribut gesetzt (von WebServer)
+    status: 'BridgeStatus' = None
+
+    def do_GET(self):
+        if self.path == '/status':
+            body = json.dumps(self.status.snapshot(), default=str).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path in ('/', '/index.html'):
+            body = _HTML_TEMPLATE.encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def log_message(self, fmt, *args):  # noqa: A002
+        logging.debug(f"HTTP {self.address_string()} {fmt % args}")
+
+
+class WebServer:
+    """Startet einen HTTP-Server in einem Daemon-Thread."""
+
+    def __init__(self, port: int, status: BridgeStatus):
+        self.port   = port
+        self.status = status
+        self._srv: Optional[HTTPServer] = None
+
+    def start(self):
+        # Handler-Klasse pro Instanz ableiten, damit status sauber gesetzt ist
+        handler = type('_H', (_WebHandler,), {'status': self.status})
+        self._srv = HTTPServer(('', self.port), handler)
+        t = threading.Thread(target=self._srv.serve_forever,
+                             name='web', daemon=True)
+        t.start()
+        logging.info(f"Web-Interface: http://0.0.0.0:{self.port}/")
+
+    def stop(self):
+        if self._srv:
+            self._srv.shutdown()
+            self._srv = None
+
+
+# ---------------------------------------------------------------------------
 # Haupt-Bridge
 # ---------------------------------------------------------------------------
 
@@ -668,6 +819,7 @@ class UccmScpiBridge:
         self.use_shm         = args.ntp_shm
         # --no-tod ist ein Alias fuer --pps-source none (Rueckwaertskompatibilitaet)
         self.pps_source      = 'none' if args.no_tod else args.pps_source
+        self.web_port        = args.web_port
         self.running         = False
         self._pty: Optional[GpsdPty]       = None
         self._shm0: Optional[NtpShm]       = None
@@ -675,6 +827,8 @@ class UccmScpiBridge:
         self._nmea                         = NmeaGenerator()
         self._last_pos_time                = 0.0
         self._tod_client: Optional[UccmScpiClient] = None
+        self._status                       = BridgeStatus(self.pps_source)
+        self._web: Optional[WebServer]     = None
 
     # --- Lifecycle ---
 
@@ -691,12 +845,18 @@ class UccmScpiBridge:
                 except OSError as e:
                     logging.warning(f"NTP SHM Unit {unit} nicht verfuegbar: {e}")
 
+        if self.web_port:
+            self._web = WebServer(self.web_port, self._status)
+            self._web.start()
+
         self._thread = threading.Thread(target=self._main_loop,
                                         name='scpi', daemon=True)
         self._thread.start()
 
     def stop(self):
         self.running = False
+        if self._web:
+            self._web.stop()
         if self._pty:
             self._pty.close()
         for shm in (self._shm0, self._shm1):
@@ -719,6 +879,7 @@ class UccmScpiBridge:
                 logging.error(f"Session-Fehler: {e}")
             finally:
                 client.close()
+                self._status.update(connected=False)
             if self.running:
                 logging.info(f"Verbindung unterbrochen. Reconnect in "
                              f"{self.reconnect_delay}s...")
@@ -737,8 +898,10 @@ class UccmScpiBridge:
                     logging.info(f"Verbinde SCPI zu {self.host}:{self.port} ...")
                     c = UccmScpiClient(self.host, self.port)
                     c.connect()
+                self._status.update(connected=True)
                 return c
             except OSError as e:
+                self._status.update(connected=False)
                 logging.warning(f"Verbindung fehlgeschlagen: {e}. "
                                 f"Retry in {self.reconnect_delay}s ...")
                 time.sleep(self.reconnect_delay)
@@ -810,6 +973,7 @@ class UccmScpiBridge:
                 last_second = gps_time.second
                 logging.debug(f"GPS-Zeit: {gps_time.isoformat()} "
                               f"(Empfang: {recv_time.isoformat()})")
+                self._status.update(last_gps_time=gps_time.isoformat())
 
                 # NMEA erzeugen und in PTY schreiben
                 sentences = self._nmea.generate(gps_time)
@@ -858,6 +1022,7 @@ class UccmScpiBridge:
             # GPS-Zeit fuer SHM1: naechste volle Sekunde (das ist die angekuendigte)
             # Wir verwenden die Sekunde des Empfangszeitpunkts (gerundet)
             gps_sec = recv_time.replace(microsecond=0)
+            self._status.update(last_pps_time=recv_time.isoformat())
             if self._shm1:
                 self._shm1.write(gps_sec, recv_time, precision=-9)
                 logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
@@ -882,6 +1047,7 @@ class UccmScpiBridge:
             if dcd and not last_dcd:
                 recv_time = datetime.now(timezone.utc)
                 gps_sec   = recv_time.replace(microsecond=0)
+                self._status.update(last_pps_time=recv_time.isoformat())
                 if self._shm1:
                     self._shm1.write(gps_sec, recv_time, precision=-9)
                     logging.debug(f"NTP SHM1 (DCD-1PPS): {gps_sec.isoformat()}")
@@ -897,6 +1063,7 @@ class UccmScpiBridge:
         if pos:
             lat, lon, alt = pos
             self._nmea.update_position(lat, lon, alt)
+            self._status.update(lat=round(lat, 7), lon=round(lon, 7), alt=round(alt, 2))
             logging.info(f"Position: {lat:+.6f} {lon:+.6f} Alt={alt:.1f}m")
         else:
             logging.warning(f"Position nicht parsebar: {resp!r}")
@@ -910,10 +1077,12 @@ class UccmScpiBridge:
             sats   = parse_sat_count(sats_resp)
             prns   = parse_prn_list(prn_resp)
             locked = parse_gps_lock(lock_resp)
+            tfom   = tfom_resp.split('\n')[0].strip()
             self._nmea.update_status(sats, locked)
             self._nmea.update_satellites(prns)
+            self._status.update(num_sats=sats, prns=prns, gps_locked=locked, tfom=tfom)
             logging.info(f"Status: {sats} Satelliten, PRNs={prns}, Lock={locked}, "
-                         f"TFOM={tfom_resp.split(chr(10))[0].strip()!r}")
+                         f"TFOM={tfom!r}")
         except Exception as e:
             logging.warning(f"Status-Abfrage fehlgeschlagen: {e}")
 
@@ -965,6 +1134,8 @@ def parse_args():
                         help='1PPS-Quelle: auto|tod|dcd|none')
     parser.add_argument('--no-tod', action='store_true',
                         help='1PPS deaktivieren (Alias fuer --pps-source none)')
+    parser.add_argument('--web-port', type=int, default=0, metavar='PORT',
+                        help='HTTP-Status-Port (0 = deaktiviert, z.B. 8080)')
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
@@ -993,6 +1164,8 @@ def main():
 
     bridge.start()
     logging.info(f"Bridge laeuft. PTY: {args.pty}")
+    if args.web_port:
+        logging.info(f"Web-Interface: http://localhost:{args.web_port}/")
     if args.ntp_shm:
         logging.info("NTP SHM aktiv:")
         logging.info("  server 127.127.28.0 minpoll 4 maxpoll 4    # NMEA")

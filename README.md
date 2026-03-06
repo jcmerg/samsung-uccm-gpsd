@@ -127,6 +127,7 @@ sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --pps-source tod
 | `--pps-source`      | `auto`          | 1PPS-Quelle: `auto`\|`tod`\|`dcd`\|`none`             |
 | `--no-tod`          | aus             | Alias fuer `--pps-source none`                         |
 | `--reconnect-delay` | `5.0`           | Sekunden bis Reconnect                                 |
+| `--web-port`        | `0`             | HTTP-Status-Port (0 = deaktiviert, z.B. `8080`)        |
 | `--log-level`       | `INFO`          | DEBUG/INFO/WARNING/ERROR                               |
 
 `host`/`port` und `--serial` schliessen sich gegenseitig aus.
@@ -176,6 +177,32 @@ refclock SHM 0 refid GPS precision 1e-1 offset 0.0 poll 4
 # 1PPS via TOD/DCD (SHM 1)
 refclock SHM 1 refid PPS precision 1e-9 prefer poll 4
 ```
+
+## Web-Interface
+
+Mit `--web-port 8080` startet die Bridge einen integrierten HTTP-Server:
+
+```bash
+sudo ./uccm_scpi_bridge.py --ntp-shm --web-port 8080 192.168.1.100 2000
+```
+
+Aufruf im Browser: `http://<bridge-host>:8080/`
+
+Die Seite aktualisiert sich alle 2 Sekunden automatisch und zeigt:
+
+| Feld           | Beschreibung                                 |
+|----------------|----------------------------------------------|
+| Verbindung     | TCP/seriell verbunden oder getrennt          |
+| GPS Lock       | Locked / Unlocked                            |
+| GPS-Zeit       | Letzter UTC-Zeitstempel vom Geraet           |
+| Position       | Breite / Laenge / Hoehe                      |
+| Satelliten     | Anzahl + PRN-Liste                           |
+| TFOM           | Zeitgenauigkeit (SYNChronization:TFOMerit?)  |
+| 1PPS-Quelle    | Konfigurierte PPS-Quelle (auto/tod/dcd/none) |
+| Letzter PPS    | Zeitstempel des letzten 1PPS-Impulses        |
+| Bridge-Start   | Startzeitpunkt der Bridge                    |
+
+Maschinen-lesbare Daten als JSON: `http://<bridge-host>:8080/status`
 
 ## Diagnose
 
