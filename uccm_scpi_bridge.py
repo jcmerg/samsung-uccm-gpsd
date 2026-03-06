@@ -551,6 +551,18 @@ def parse_prn_list(resp: str) -> list:
     return [int(m) for m in re.findall(r'[+-]?(\d+)', resp)]
 
 
+def parse_system_status(resp: str) -> dict:
+    """Extrahiert ANT-Spannung und Temperatur aus SYSTEM:STATUS?-Antwort."""
+    result = {}
+    m = re.search(r'ANT V=([\d.]+V)', resp)
+    if m:
+        result['ant_voltage'] = m.group(1)
+    m = re.search(r'Temp\s*=\s*([\d.]+)', resp)
+    if m:
+        result['temperature'] = m.group(1) + ' \u00b0C'
+    return result
+
+
 def parse_tod_seconds_bcd(pkt: bytes) -> Optional[int]:
     """Extrahiert Sekunden (BCD) aus Byte 30 des TOD-Pakets."""
     if len(pkt) < 31 or pkt[0] != 0xC5:
@@ -669,6 +681,8 @@ class BridgeStatus:
             'last_gps_time': None,   # ISO-String
             'last_pps_time': None,   # ISO-String
             'tfom':         '',
+            'ant_voltage':  None,
+            'temperature':  None,
             'pps_source':   pps_source_cfg,
             'started_at':   datetime.now(timezone.utc).isoformat(),
         }
@@ -741,6 +755,8 @@ async function refresh() {
       ['Position',     d.lat !== null ? `${d.lat.toFixed(6)} / ${d.lon.toFixed(6)} / ${d.alt.toFixed(1)} m` : '\u2013'],
       ['Satelliten',   d.num_sats + (d.prns.length ? ' (PRNs: ' + d.prns.join(', ') + ')' : '')],
       ['TFOM',         fmt(d.tfom)],
+      ['ANT-Spannung', fmt(d.ant_voltage)],
+      ['Temperatur',   fmt(d.temperature)],
       ['1PPS-Quelle',  fmt(d.pps_source)],
       ['Letzter PPS',  fmt(d.last_pps_time)],
       ['Bridge-Start', fmt(d.started_at)],
@@ -1165,15 +1181,18 @@ class UccmScpiBridge:
             prn_resp  = client.query('GPS:SATellite:TRACking?', timeout=3)
             lock_resp = client.query('LED:GPSLock?', timeout=3)
             tfom_resp = client.query('SYNChronization:TFOMerit?', timeout=3)
+            sys_resp  = client.query('SYSTEM:STATUS?', timeout=5)
             sats   = parse_sat_count(sats_resp)
             prns   = parse_prn_list(prn_resp)
             locked = parse_gps_lock(lock_resp)
             tfom   = tfom_resp.split('\n')[0].strip()
+            sys_st = parse_system_status(sys_resp)
             self._nmea.update_status(sats, locked)
             self._nmea.update_satellites(prns)
-            self._status.update(num_sats=sats, prns=prns, gps_locked=locked, tfom=tfom)
+            self._status.update(num_sats=sats, prns=prns, gps_locked=locked,
+                                tfom=tfom, **sys_st)
             logging.info(f"Status: {sats} Satelliten, PRNs={prns}, Lock={locked}, "
-                         f"TFOM={tfom!r}")
+                         f"TFOM={tfom!r}, {sys_st}")
         except Exception as e:
             logging.warning(f"Status-Abfrage fehlgeschlagen: {e}")
 
