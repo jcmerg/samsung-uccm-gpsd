@@ -871,20 +871,23 @@ class _WebHandler(BaseHTTPRequestHandler):
         Falls back to the main client if the device refuses a second
         connection.
         """
-        try:
-            lc = self.make_log_client()
-            lc.connect()
+        if self.make_log_client is not None:
             try:
-                return lc.query(cmd, timeout=timeout)
-            finally:
-                lc.disconnect()
-        except OSError:
-            # Device may not accept a second TCP connection – fall back.
-            logging.debug("Log connection failed, falling back to main client")
-            main = self.get_client()
-            if main is None:
-                raise ConnectionError("Not connected")
-            return main.query(cmd, timeout=timeout)
+                lc = self.make_log_client()
+                lc.connect()
+                try:
+                    return lc.query(cmd, timeout=timeout)
+                finally:
+                    lc.disconnect()
+            except Exception:
+                # Device may not accept a second connection (serial mode,
+                # single-client TCP, …) – fall back to the main client.
+                logging.debug("Log connection failed, falling back to main client",
+                              exc_info=True)
+        main = self.get_client()
+        if main is None:
+            raise ConnectionError("Not connected")
+        return main.query(cmd, timeout=timeout)
 
     def do_GET(self):
         path = self.path.split('?')[0]
@@ -1012,10 +1015,17 @@ class UccmScpiBridge:
                     logging.warning(f"NTP SHM Unit {unit} not available: {e}")
 
         if self.web_port:
+            # A separate log connection is only possible in TCP mode.
+            # In serial mode make_log_client stays None and log queries
+            # fall back to the shared main client.
+            make_log_client = (
+                (lambda: UccmScpiClient(self.host, self.port))
+                if not self.serial_device else None
+            )
             self._web = WebServer(
                 self.web_port, self._status,
                 get_client=lambda: self._scpi_client,
-                make_log_client=lambda: UccmScpiClient(self.host, self.port),
+                make_log_client=make_log_client,
             )
             self._web.start()
 
