@@ -43,7 +43,7 @@ import sys
 import termios
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, Tuple
 
@@ -1209,12 +1209,21 @@ class UccmScpiBridge:
                           f"{'None' if sec_bcd is None else f'{sec_bcd:#04x}'}), "
                           f"received: {recv_time.isoformat()}")
 
-            # GPS second from TOD packet arrival time.
-            # TOD packets arrive anywhere from 10–700 ms after the PPS edge
-            # (device-dependent); this variable latency is the unavoidable
-            # jitter for a software TCP PPS source.  SHM0 (coarse reference)
-            # is managed by the polling loop; here we only update SHM1.
+            # Determine GPS second from BCD field in the TOD packet.
+            # recv_time.replace(microsecond=0) is a first approximation, but
+            # it can land on the wrong second if the packet arrives close to
+            # a second boundary (e.g. recv_time=22:16:20.998 while the packet
+            # announces second 21).  Correct by ±1 s when sec_bcd disagrees.
             gps_sec = recv_time.replace(microsecond=0)
+            if sec_bcd is not None and gps_sec.second != sec_bcd:
+                delta = (sec_bcd - gps_sec.second) % 60
+                if delta == 1:          # packet arrived just before the announced second
+                    gps_sec += timedelta(seconds=1)
+                elif delta == 59:       # packet arrived just after the announced second
+                    gps_sec -= timedelta(seconds=1)
+                else:
+                    logging.warning(f"TOD BCD second {sec_bcd} far from "
+                                    f"recv_time second {gps_sec.second}, ignoring")
             self._status.update(last_pps_time=recv_time.isoformat())
             if self._shm1:
                 self._shm1.write(gps_sec, recv_time, precision=-9)
