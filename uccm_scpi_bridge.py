@@ -996,6 +996,7 @@ class UccmScpiBridge:
         self._last_pos_time                = 0.0
         self._tod_client: Optional[UccmScpiClient] = None
         self._last_bcd_warn_time: float = 0.0   # rate-limit TOD BCD mismatch warnings
+        self._last_delay_warn_time: float = 0.0  # rate-limit TOD recv delay warnings
         self._scpi_client: Optional[UccmScpiClient] = None  # aktiver Client fuer Web-API
         self._status                       = BridgeStatus(self.pps_source)
         self._web: Optional[WebServer]     = None
@@ -1241,9 +1242,12 @@ class UccmScpiBridge:
                 pps_delay = (recv_time - gps_sec).total_seconds()
                 if not bcd_ok:
                     logging.debug("TOD SHM1 skipped: stale BCD")
-                elif pps_delay > 0.700:
-                    logging.warning(f"TOD recv delay {pps_delay:.3f}s too large, "
-                                    f"skipping SHM1 (falseticker prevention)")
+                elif pps_delay > 0.990:
+                    now = time.monotonic()
+                    if now - self._last_delay_warn_time >= 30.0:
+                        logging.warning(f"TOD recv delay {pps_delay:.3f}s too large, "
+                                        f"skipping SHM1 (falseticker prevention)")
+                        self._last_delay_warn_time = now
                 else:
                     self._shm1.write(gps_sec, recv_time, precision=-9)
                     logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
