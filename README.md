@@ -198,11 +198,32 @@ Die Seite aktualisiert sich alle 2 Sekunden automatisch und zeigt:
 | Position       | Breite / Laenge / Hoehe                      |
 | Satelliten     | Anzahl + PRN-Liste                           |
 | TFOM           | Zeitgenauigkeit (SYNChronization:TFOMerit?)  |
+| ANT-Spannung   | Antenne: Versorgungsspannung                 |
+| ANT-Strom      | Antenne: Stromaufnahme                       |
+| Temperatur     | Geraetetemperatur                            |
 | 1PPS-Quelle    | Konfigurierte PPS-Quelle (auto/tod/dcd/none) |
 | Letzter PPS    | Zeitstempel des letzten 1PPS-Impulses        |
 | Bridge-Start   | Startzeitpunkt der Bridge                    |
 
-Maschinen-lesbare Daten als JSON: `http://<bridge-host>:8080/status`
+ANT-Spannung, ANT-Strom und Temperatur werden alle 30 Sekunden aus
+`SYSTEM:STATUS?` ausgelesen.
+
+### Diagnose-Log
+
+Ueber die Web-Oberflaeche kann das interne UCCM-Diagnose-Log abgerufen
+und geloescht werden:
+
+- **Log laden** – liest das Log via `DIAGNOSTIC:LOG:READ:ALL?`
+- **Log loeschen** – loescht das Log via `DIAGNOSTIC:LOG:CLEAR`
+
+### HTTP-API
+
+| Endpunkt         | Methode | Beschreibung                              |
+|------------------|---------|-------------------------------------------|
+| `/`              | GET     | Web-Interface (HTML)                      |
+| `/status`        | GET     | Bridge-Status als JSON                    |
+| `/log`           | GET     | Diagnose-Log als JSON (`{"lines": [...]}`) |
+| `/log/clear`     | POST    | Diagnose-Log loeschen                     |
 
 ## Diagnose
 
@@ -258,6 +279,9 @@ allen Azimuten = 0 als ungueltig ablehnen (SiRFstar-Workaround).
 | `GPS:SATellite:TRACking?` | `+prn,...,+prn` | alle 30 s |
 | `LED:GPSLock?` | `Locked` / `Unlocked` | alle 30 s |
 | `SYNChronization:TFOMerit?` | z.B. `1 ~ 10 nsec` | alle 30 s |
+| `SYSTEM:STATUS?` | Mehrzeiliger Statusblock (ANT, Temp, ...) | alle 30 s |
+| `DIAGNOSTIC:LOG:READ:ALL?` | Zeilenweise Log-Eintraege | auf Anfrage (Web-UI) |
+| `DIAGNOSTIC:LOG:CLEAR` | — | auf Anfrage (Web-UI) |
 | `TOD EN` / `TOD DI` | - | einmalig beim Start (`--pps-source tod`) |
 
 ### TOD-Pakete (1PPS via `--pps-source tod`)
