@@ -29,6 +29,7 @@ Ausfuehren:
 import argparse
 import ctypes
 import ctypes.util
+import fcntl
 import logging
 import os
 import pty
@@ -43,6 +44,10 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional, Tuple
+
+# Linux-Konstanten fuer serielle DCD-Abfrage
+_TIOCMGET = getattr(termios, 'TIOCMGET', 0x5415)
+_TIOCM_CD = 0x040  # DCD-Bit im Modem-Status
 
 # ---------------------------------------------------------------------------
 # NMEA-Hilfsfunktionen
@@ -76,6 +81,10 @@ def deg_to_nmea_lon(deg: float) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 class ShmTime(ctypes.Structure):
+    # Struktur entspricht ntpd/refclock_shm.c ohne NSec-Felder (96 Bytes auf 64-Bit).
+    # Die NSec-Felder wurden in neueren ntpd-Versionen hinzugefuegt, sind auf
+    # diesem System aber nicht vorhanden (ipcs zeigt 96 Bytes fuer ntpd-Segmente).
+    # mode=0 → ntpd liest clockTimeStampSec/USec; NSec nicht benoetigt.
     _fields_ = [
         ('mode',                   ctypes.c_int),
         ('count',                  ctypes.c_int),
@@ -87,9 +96,7 @@ class ShmTime(ctypes.Structure):
         ('precision',              ctypes.c_int),
         ('nsamples',               ctypes.c_int),
         ('valid',                  ctypes.c_int),
-        ('clockTimeStampNSec',     ctypes.c_uint),
-        ('receiveTimeStampNSec',   ctypes.c_uint),
-        ('dummy',                  ctypes.c_int * 10),
+        ('dummy',                  ctypes.c_int * 11),  # padding auf 96 Bytes
     ]
 
 
@@ -135,17 +142,15 @@ class NtpShm:
         gps_s, gps_us   = int(gps_e),  int((gps_e  - int(gps_e))  * 1e6)
         recv_s, recv_us = int(recv_e), int((recv_e - int(recv_e)) * 1e6)
         shm.valid = 0
-        shm.count += 1
+        shm.count += 1                       # Ungerade = Schreibvorgang laeuft
         shm.clockTimeStampSec    = gps_s
         shm.clockTimeStampUSec   = gps_us
-        shm.clockTimeStampNSec   = gps_us * 1000
         shm.receiveTimeStampSec  = recv_s
         shm.receiveTimeStampUSec = recv_us
-        shm.receiveTimeStampNSec = recv_us * 1000
         shm.leap      = 0
         shm.precision = precision
         shm.mode      = 0
-        shm.count    += 1
+        shm.count    += 1                    # Gerade = Schreibvorgang abgeschlossen
         shm.valid     = 1
 
     def close(self):
@@ -219,6 +224,72 @@ _TOD_RE = re.compile(r'^(c5(?:\s+[0-9a-f]{2}){43})(.*)', re.IGNORECASE | re.DOTA
 _SENTINEL = object()  # Queue-Abbruch-Signal
 
 
+# ---------------------------------------------------------------------------
+# Serieller Transport (Alternative zu TCP-Socket)
+# ---------------------------------------------------------------------------
+
+class _SerialTransport:
+    """
+    Seriell-Transport fuer UccmScpiClient.
+    Duck-Type-kompatibel mit socket.socket (recv, sendall, fileno, close).
+    Ermoeglicht 1PPS-Erkennung via DCD-Pin (read_dcd).
+    """
+    _BAUD_CONSTS = {b: getattr(termios, f'B{b}', None)
+                    for b in (1200, 2400, 4800, 9600, 19200, 38400,
+                               57600, 115200, 230400)}
+
+    def __init__(self, device: str, baud: int = 9600):
+        self.device = device
+        self.baud   = baud
+        self.fd: Optional[int] = None
+
+    def connect(self):
+        baud_c = self._BAUD_CONSTS.get(self.baud)
+        if baud_c is None:
+            raise ValueError(f"Unbekannte Baudrate: {self.baud}")
+        self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY)
+        attrs = list(termios.tcgetattr(self.fd))
+        attrs[0] = termios.IGNBRK                          # iflag
+        attrs[1] = 0                                       # oflag
+        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag
+        attrs[3] = 0                                       # lflag: kein Echo, non-canonical
+        attrs[4] = baud_c                                  # ispeed
+        attrs[5] = baud_c                                  # ospeed
+        attrs[6][termios.VMIN]  = 1                        # blockieren bis 1 Byte da
+        attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        logging.info(f"Serieller Port geoeffnet: {self.device} @ {self.baud} Baud")
+
+    def recv(self, n: int) -> bytes:
+        return os.read(self.fd, n)
+
+    def sendall(self, data: bytes):
+        total = 0
+        while total < len(data):
+            written = os.write(self.fd, data[total:])
+            total += written
+
+    def fileno(self) -> int:
+        return self.fd
+
+    def settimeout(self, _t):
+        pass  # Seriell: Timeout wird via select gesteuert
+
+    def read_dcd(self) -> bool:
+        """Liefert True wenn DCD-Pin gesetzt (1PPS-Puls erkannt)."""
+        buf = bytearray(4)
+        fcntl.ioctl(self.fd, _TIOCMGET, buf)
+        return bool(int.from_bytes(buf, sys.byteorder) & _TIOCM_CD)
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
 class UccmScpiClient:
     """
     SCPI-Client mit einem einzigen Lese-Thread (Demultiplexer).
@@ -247,19 +318,29 @@ class UccmScpiClient:
     # ------------------------------------------------------------------
 
     def connect(self):
+        """TCP-Verbindung herstellen."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
         self.sock.connect((self.host, self.port))
         self.sock.settimeout(None)  # Reader-Thread blockiert selbst
         self._connected = True
+        self._start_reader()
+        self._drain_scpi(2.0)
+        logging.info(f"SCPI-Verbunden mit {self.host}:{self.port}")
 
+    def connect_serial(self, transport: '_SerialTransport'):
+        """Serielle Verbindung herstellen (Alternative zu TCP)."""
+        transport.connect()
+        self.sock = transport  # duck typing: recv/sendall/fileno/close
+        self._connected = True
+        self._start_reader()
+        self._drain_scpi(2.0)
+        logging.info(f"SCPI-Verbunden (seriell) mit {transport.device}")
+
+    def _start_reader(self):
         self._reader = threading.Thread(target=self._reader_loop,
                                         name='scpi-reader', daemon=True)
         self._reader.start()
-
-        # Anfangs-Prompt abwarten
-        self._drain_scpi(2.0)
-        logging.info(f"SCPI-Verbunden mit {self.host}:{self.port}")
 
     def close(self):
         self._connected = False
@@ -580,6 +661,8 @@ class UccmScpiBridge:
     def __init__(self, args):
         self.host            = args.host
         self.port            = args.port
+        self.serial_device   = args.serial       # None → TCP-Modus
+        self.serial_baud     = args.baud
         self.pty_path        = args.pty
         self.reconnect_delay = args.reconnect_delay
         self.use_shm         = args.ntp_shm
@@ -643,9 +726,16 @@ class UccmScpiBridge:
     def _connect_scpi(self) -> Optional[UccmScpiClient]:
         while self.running:
             try:
-                logging.info(f"Verbinde SCPI zu {self.host}:{self.port} ...")
-                c = UccmScpiClient(self.host, self.port)
-                c.connect()
+                if self.serial_device:
+                    logging.info(f"Verbinde SCPI via seriell: {self.serial_device} "
+                                 f"@ {self.serial_baud} Baud ...")
+                    c = UccmScpiClient(self.serial_device, 0)
+                    t = _SerialTransport(self.serial_device, self.serial_baud)
+                    c.connect_serial(t)
+                else:
+                    logging.info(f"Verbinde SCPI zu {self.host}:{self.port} ...")
+                    c = UccmScpiClient(self.host, self.port)
+                    c.connect()
                 return c
             except OSError as e:
                 logging.warning(f"Verbindung fehlgeschlagen: {e}. "
@@ -666,16 +756,24 @@ class UccmScpiBridge:
         self._update_position(client)
         self._update_status(client)
 
-        # Optionaler TOD-Thread fuer 1PPS-Timing
-        tod_thread = None
+        # 1PPS-Thread: TOD-Pakete (TCP) oder DCD-Pin (seriell)
+        pps_thread = None
         if not self.no_tod and self._shm1:
-            client.tod_enable()
-            self._tod_client = client
-            tod_thread = threading.Thread(
-                target=self._tod_loop, args=(client,),
-                name='tod', daemon=True
-            )
-            tod_thread.start()
+            if self.serial_device and isinstance(client.sock, _SerialTransport):
+                # Seriell: 1PPS via DCD-Flanke
+                pps_thread = threading.Thread(
+                    target=self._dcd_loop, args=(client.sock,),
+                    name='dcd-pps', daemon=True
+                )
+            else:
+                # TCP: 1PPS via TOD-Datenstrom
+                client.tod_enable()
+                self._tod_client = client
+                pps_thread = threading.Thread(
+                    target=self._tod_loop, args=(client,),
+                    name='tod', daemon=True
+                )
+            pps_thread.start()
 
         # Polling-Loop: 1x pro Sekunde TIME:STRing? + periodisch GPS-Daten
         poll_cycle  = 0
@@ -729,8 +827,8 @@ class UccmScpiBridge:
             sleep_s = max(0, 1.0 - elapsed)
             time.sleep(sleep_s)
 
-        if tod_thread:
-            tod_thread.join(timeout=2)
+        if pps_thread:
+            pps_thread.join(timeout=2)
 
     def _tod_loop(self, client: UccmScpiClient):
         """
@@ -755,6 +853,31 @@ class UccmScpiBridge:
                 logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
 
         logging.info("TOD-Thread beendet")
+
+    def _dcd_loop(self, transport: '_SerialTransport'):
+        """
+        1PPS via DCD-Pin des seriellen Ports (serieller Modus).
+        Erkennt steigende DCD-Flanke und schreibt Zeitstempel in NTP SHM1.
+        """
+        logging.info("DCD-1PPS-Thread gestartet")
+        last_dcd = False
+        while self.running:
+            try:
+                dcd = transport.read_dcd()
+            except OSError as e:
+                logging.warning(f"DCD-Lesefehler: {e}")
+                time.sleep(0.1)
+                continue
+            # Steigende Flanke: DCD geht von Low auf High
+            if dcd and not last_dcd:
+                recv_time = datetime.now(timezone.utc)
+                gps_sec   = recv_time.replace(microsecond=0)
+                if self._shm1:
+                    self._shm1.write(gps_sec, recv_time, precision=-9)
+                    logging.debug(f"NTP SHM1 (DCD-1PPS): {gps_sec.isoformat()}")
+            last_dcd = dcd
+            time.sleep(0.001)  # 1ms Polling
+        logging.info("DCD-1PPS-Thread beendet")
 
     # --- Hilfsmethoden ---
 
@@ -798,25 +921,43 @@ def make_signal_handler(bridge: UccmScpiBridge):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Samsung UCCM SCPI-Bridge: TCP SCPI -> PTY (gpsd) + NTP SHM',
+        description='Samsung UCCM SCPI-Bridge: TCP/Seriell SCPI -> PTY (gpsd) + NTP SHM',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            'Verbindung (eines erforderlich):\n'
+            '  TCP:     HOST PORT                   (z.B. 172.16.20.30 2000)\n'
+            '  Seriell: --serial /dev/ttyUSB0       (1PPS via DCD-Pin)\n'
+        )
     )
-    parser.add_argument('host',
-                        help='Hostname/IP des UCCM (z.B. 172.16.20.30)')
-    parser.add_argument('port', type=int,
+    # Transport: TCP (positional) oder seriell (--serial), gegenseitig exklusiv
+    parser.add_argument('host', nargs='?', default=None,
+                        help='Hostname/IP des UCCM fuer TCP-Verbindung')
+    parser.add_argument('port', nargs='?', type=int, default=None,
                         help='TCP-Port der UCCM-CLI (typisch: 2000)')
+    parser.add_argument('--serial', metavar='GERAET', default=None,
+                        help='Serielles Geraet statt TCP (z.B. /dev/ttyUSB0)')
+    parser.add_argument('--baud', type=int, default=9600, metavar='BAUD',
+                        help='Baudrate fuer serielles Geraet')
     parser.add_argument('--pty', default='/dev/uccm_gps',
                         help='PTY-Symlink-Pfad fuer gpsd')
     parser.add_argument('--reconnect-delay', type=float, default=5.0,
                         metavar='SEK')
     parser.add_argument('--ntp-shm', action='store_true',
-                        help='NTP SHM aktivieren (Unit 0=NMEA, Unit 1=TOD-1PPS)')
+                        help='NTP SHM aktivieren (Unit 0=NMEA, Unit 1=1PPS)')
     parser.add_argument('--no-tod', action='store_true',
-                        help='TOD-Datenstrom nicht aktivieren '
-                             '(kein praezises 1PPS-SHM, aber kein Mux-Problem)')
+                        help='1PPS-Quelle deaktivieren (kein SHM Unit 1)')
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Validierung: entweder TCP oder seriell, nicht beides, nicht keines
+    if args.serial:
+        if args.host or args.port:
+            parser.error('--serial und HOST/PORT schliessen sich aus')
+    else:
+        if not args.host or args.port is None:
+            parser.error('HOST und PORT angeben oder --serial GERAET verwenden')
+    return args
 
 
 def main():
