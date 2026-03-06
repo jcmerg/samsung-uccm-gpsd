@@ -666,7 +666,8 @@ class UccmScpiBridge:
         self.pty_path        = args.pty
         self.reconnect_delay = args.reconnect_delay
         self.use_shm         = args.ntp_shm
-        self.no_tod          = args.no_tod
+        # --no-tod ist ein Alias fuer --pps-source none (Rueckwaertskompatibilitaet)
+        self.pps_source      = 'none' if args.no_tod else args.pps_source
         self.running         = False
         self._pty: Optional[GpsdPty]       = None
         self._shm0: Optional[NtpShm]       = None
@@ -756,17 +757,25 @@ class UccmScpiBridge:
         self._update_position(client)
         self._update_status(client)
 
-        # 1PPS-Thread: TOD-Pakete (TCP) oder DCD-Pin (seriell)
+        # 1PPS-Thread: Quelle per --pps-source bestimmen
+        # 'auto': TCP→TOD, seriell→DCD  |  'tod': TOD  |  'dcd': DCD  |  'none': kein 1PPS
         pps_thread = None
-        if not self.no_tod and self._shm1:
-            if self.serial_device and isinstance(client.sock, _SerialTransport):
-                # Seriell: 1PPS via DCD-Flanke
+        effective_pps = self.pps_source
+        if effective_pps == 'auto':
+            effective_pps = 'dcd' if self.serial_device else 'tod'
+        if effective_pps == 'dcd' and not self.serial_device:
+            logging.warning("--pps-source=dcd erfordert --serial; 1PPS deaktiviert")
+            effective_pps = 'none'
+
+        if effective_pps != 'none' and self._shm1:
+            if effective_pps == 'dcd':
+                logging.info("1PPS-Quelle: DCD-Pin")
                 pps_thread = threading.Thread(
                     target=self._dcd_loop, args=(client.sock,),
                     name='dcd-pps', daemon=True
                 )
-            else:
-                # TCP: 1PPS via TOD-Datenstrom
+            else:  # tod
+                logging.info("1PPS-Quelle: TOD-Datenstrom")
                 client.tod_enable()
                 self._tod_client = client
                 pps_thread = threading.Thread(
@@ -927,7 +936,13 @@ def parse_args():
         epilog=(
             'Verbindung (eines erforderlich):\n'
             '  TCP:     HOST PORT                   (z.B. 172.16.20.30 2000)\n'
-            '  Seriell: --serial /dev/ttyUSB0       (1PPS via DCD-Pin)\n'
+            '  Seriell: --serial /dev/ttyUSB0\n'
+            '\n'
+            '1PPS-Quelle (--pps-source):\n'
+            '  auto  TCP→TOD-Pakete, seriell→DCD-Pin  (Standard)\n'
+            '  tod   TOD-Datenstrom (TCP und seriell)\n'
+            '  dcd   DCD-Pin        (nur seriell)\n'
+            '  none  kein 1PPS\n'
         )
     )
     # Transport: TCP (positional) oder seriell (--serial), gegenseitig exklusiv
@@ -945,8 +960,11 @@ def parse_args():
                         metavar='SEK')
     parser.add_argument('--ntp-shm', action='store_true',
                         help='NTP SHM aktivieren (Unit 0=NMEA, Unit 1=1PPS)')
+    parser.add_argument('--pps-source', default='auto',
+                        choices=['auto', 'tod', 'dcd', 'none'],
+                        help='1PPS-Quelle: auto|tod|dcd|none')
     parser.add_argument('--no-tod', action='store_true',
-                        help='1PPS-Quelle deaktivieren (kein SHM Unit 1)')
+                        help='1PPS deaktivieren (Alias fuer --pps-source none)')
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
