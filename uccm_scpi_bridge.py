@@ -513,26 +513,27 @@ class NmeaGenerator:
 
         sentences = []
 
-        # $GPRMC
+        # $GPRMC  (Cycle-Starter laut gpsd)
         sentences.append(build_nmea(
             'GPRMC', tstr, status,
             lat_s, lat_h, lon_s, lon_h,
             '0.000', '0.00', dstr, '', '', 'A'
         ))
 
-        # $GPGGA
+        # $GPZDA  (praeziseste Zeitquelle fuer NTP; muss vor GPGGA kommen,
+        #          da gpsd GPGGA als Cycle-Ender behandelt)
+        sentences.append(build_nmea(
+            'GPZDA', tstr,
+            f"{now.day:02d}", f"{now.month:02d}", f"{now.year:04d}",
+            '00', '00'
+        ))
+
+        # $GPGGA  (Cycle-Ender laut gpsd)
         sentences.append(build_nmea(
             'GPGGA', tstr,
             lat_s, lat_h, lon_s, lon_h,
             fix_qual, f"{sats:02d}",
             '1.0', f"{alt:.2f}", 'M', '47.0', 'M', '', ''
-        ))
-
-        # $GPZDA  (praziseste Zeitquelle fuer NTP)
-        sentences.append(build_nmea(
-            'GPZDA', tstr,
-            f"{now.day:02d}", f"{now.month:02d}", f"{now.year:04d}",
-            '00', '00'
         ))
 
         return sentences
