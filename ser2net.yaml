@@ -1,0 +1,52 @@
+%YAML 1.1
+---
+# Samsung UCCM GPS - ser2net Konfiguration
+# ==========================================
+# Exposiert den seriellen NMEA-Port des UCCM-Moduls ueber TCP.
+#
+# Voraussetzungen:
+#   apt install ser2net  (>= 4.x fuer YAML-Format)
+#
+# Verwendung:
+#   ser2net -c /etc/ser2net.yaml
+#   # oder fuer dieses Repo:
+#   ser2net -c ser2net.yaml
+#
+# Geraetepfad anpassen:
+#   /dev/ttyUSB0  - typisch fuer USB-Seriell-Adapter
+#   /dev/ttyS0    - typisch fuer eingebauten COM-Port
+#
+# Verbindungsschema:
+#   Samsung UCCM (seriell, 4800 Baud)
+#       | /dev/ttyUSB0
+#   ser2net
+#       |-- TCP 2001 (RFC 2217, DCD/1PPS-Uebertragung) --> uccm_telnet_bridge / cutecom / minicom
+#       '-- TCP 2002 (Roh-NMEA-Stream)                 --> gpsd tcp://...  / netcat
+
+# ---------------------------------------------------------------------------
+# Port 2001: RFC 2217 - Serielle Emulation mit Modem-Control-Signalen
+# ---------------------------------------------------------------------------
+# Benoetigt fuer 1PPS via DCD-Pin (Bit 7 im RFC-2217-Modem-State-Byte).
+# uccm_scpi_bridge.py liest DCD-Flanken hierueber bei Einsatz ohne TOD-Stream.
+#
+connection: &uccm-rfc2217
+  accepter: telnet(rfc2217),tcp,0.0.0.0,2001
+  connector: serialdev,/dev/ttyUSB0,4800n81,local
+  options:
+    kickolduser: true
+    max-connections: 1
+
+# ---------------------------------------------------------------------------
+# Port 2002: Roh-TCP - Einfacher NMEA-Bytestream ohne Protokoll-Overhead
+# ---------------------------------------------------------------------------
+# Direkt lesbar mit:
+#   gpsd -n tcp://localhost:2002
+#   nc localhost 2002
+#   gpspipe -r -x 5 tcp://localhost:2002
+#
+connection: &uccm-raw-nmea
+  accepter: tcp,0.0.0.0,2002
+  connector: serialdev,/dev/ttyUSB0,4800n81,local
+  options:
+    kickolduser: true
+    max-connections: 4

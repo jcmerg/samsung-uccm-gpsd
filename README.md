@@ -29,6 +29,36 @@ Der Ankunftszeitpunkt des Pakets wird als SHM Unit 1 eingetragen.
 - Linux (PTY und SYSV SHM)
 - Netzwerkzugang zum UCCM auf TCP Port 2000
 
+## ser2net (optionaler serieller Zugang)
+
+Falls der UCCM ueber einen **seriellen NMEA-Port** (4800 Baud) angebunden ist,
+kann `ser2net` diesen Port netzwerktransparent bereitstellen. RFC 2217 uebertraegt
+dabei den DCD-Pin (1PPS-Signal) als Modem-State-Byte.
+
+```
+Samsung UCCM (seriell, 4800 Baud)
+    | /dev/ttyUSB0
+ser2net
+    |-- TCP 2001 (RFC 2217, DCD/1PPS) --> uccm_telnet_bridge / minicom
+    '-- TCP 2002 (Roh-NMEA)           --> gpsd tcp://...  / nc
+```
+
+**Konfiguration installieren:**
+
+```bash
+# Geraetepfad in ser2net.yaml anpassen (/dev/ttyUSB0 o.ae.)
+sudo cp ser2net.yaml /etc/ser2net.yaml
+sudo systemctl enable --now ser2net
+```
+
+**gpsd direkt mit TCP-NMEA-Stream:**
+
+```bash
+gpsd -n tcp://HOSTNAME:2002
+```
+
+Die mitgelieferte `ser2net.yaml` enthaelt beide Ports vorkonfiguriert.
+
 ## Installation
 
 ```bash
