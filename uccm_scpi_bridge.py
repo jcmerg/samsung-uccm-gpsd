@@ -868,7 +868,8 @@ class WebServer:
     def start(self):
         # Handler-Klasse pro Instanz ableiten, damit status sauber gesetzt ist
         handler = type('_H', (_WebHandler,),
-                       {'status': self.status, 'get_client': self.get_client})
+                       {'status': self.status,
+                        'get_client': staticmethod(self.get_client)})
         self._srv = HTTPServer(('', self.port), handler)
         t = threading.Thread(target=self._srv.serve_forever,
                              name='web', daemon=True)
