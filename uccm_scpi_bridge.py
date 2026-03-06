@@ -995,6 +995,7 @@ class UccmScpiBridge:
         self._nmea                         = NmeaGenerator()
         self._last_pos_time                = 0.0
         self._tod_client: Optional[UccmScpiClient] = None
+        self._last_bcd_warn_time: float = 0.0   # rate-limit TOD BCD mismatch warnings
         self._scpi_client: Optional[UccmScpiClient] = None  # aktiver Client fuer Web-API
         self._status                       = BridgeStatus(self.pps_source)
         self._web: Optional[WebServer]     = None
@@ -1223,10 +1224,13 @@ class UccmScpiBridge:
                 elif delta == 59:       # packet arrived just after the announced second
                     gps_sec -= timedelta(seconds=1)
                 else:
-                    logging.warning(f"TOD BCD second {sec_bcd} far from "
-                                    f"recv_time second {gps_sec.second} "
-                                    f"(delta={(sec_bcd - gps_sec.second) % 60}s, "
-                                    f"system clock may not be NTP-synchronized yet), ignoring")
+                    now = time.monotonic()
+                    if now - self._last_bcd_warn_time >= 30.0:
+                        logging.warning(f"TOD BCD second {sec_bcd} far from "
+                                        f"recv_time second {gps_sec.second} "
+                                        f"(delta={(sec_bcd - gps_sec.second) % 60}s, "
+                                        f"system clock may not be NTP-synchronized yet), ignoring")
+                        self._last_bcd_warn_time = now
                     bcd_ok = False
             self._status.update(last_pps_time=recv_time.isoformat())
             if self._shm1:
