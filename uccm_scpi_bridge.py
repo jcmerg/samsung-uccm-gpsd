@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Samsung UCCM SCPI-zu-NMEA-Bridge
+Samsung UCCM SCPI-to-NMEA Bridge
 ==================================
-Verbindet sich per TCP mit der SCPI-CLI des Samsung UCCM GPS-Moduls
-(Port 2000), liest GPS-Daten via SCPI-Befehle und erzeugt daraus
-NMEA-0183-Saetze fuer gpsd sowie NTP-SHM-Zeitstempel fuer ntpd/chrony.
+Connects via TCP to the SCPI-CLI of the Samsung UCCM GPS module
+(port 2000), reads GPS data via SCPI commands, and generates
+NMEA-0183 sentences for gpsd as well as NTP SHM timestamps for ntpd/chrony.
 
-UCCM SCPI-Befehle (ermittelt vom Geraet):
-  TIME:STRing?                       UTC-Zeit: "YYYY/MM/DD HH:MM:SS"
+UCCM SCPI commands (queried from device):
+  TIME:STRing?                       UTC time: "YYYY/MM/DD HH:MM:SS"
   GPS:POSition?                      Position: "N,+DD,+MM,+SS.sss,E,+DD,+MM,+SS.sss,+HHH.hh"
-  GPS:SATellite:TRACking:COUNt?      Anzahl getrackter Satelliten: "+N"
-  GPS:SATellite:TRACking?            PRN-Liste: "+prn,...,+prn"
-  LED:GPSLock?                       Lock-Status: "Locked" | "Unlocked"
-  SYNChronization:TFOMerit?          Zeitgenauigkeit: "1 ~ 10 nsec"
-  TOD EN / TOD DI                    1PPS-TOD-Datenstrom an/aus
+  GPS:SATellite:TRACking:COUNt?      Number of tracked satellites: "+N"
+  GPS:SATellite:TRACking?            PRN list: "+prn,...,+prn"
+  LED:GPSLock?                       Lock status: "Locked" | "Unlocked"
+  SYNChronization:TFOMerit?          Time accuracy: "1 ~ 10 nsec"
+  TOD EN / TOD DI                    1PPS TOD data stream on/off
 
-TOD-Pakete (hex-kodiert in ASCII, 44 Bytes pro Paket, ein Paket pro Sekunde):
-  Format: "XX XX XX ... XX \\r\\n"  (44 Bytes = 132 Zeichen inkl. Leerzeichen)
-  Byte  0:    0xC5 (Sync)
-  Byte 30:    BCD-Sekunden (0x00..0x59)
-  Andere Felder: proprietaeres Samsung-Format, fuer Timing nicht benoetigt.
+TOD packets (hex-encoded in ASCII, 44 bytes per packet, one packet per second):
+  Format: "XX XX XX ... XX \\r\\n"  (44 bytes = 132 characters incl. spaces)
+  Byte  0:    0xC5 (sync)
+  Byte 30:    BCD seconds (0x00..0x59)
+  Other fields: proprietary Samsung format, not needed for timing.
 
-Ausfuehren:
+Usage:
     ./uccm_scpi_bridge.py 172.16.20.30 2000
     gpsd -n /dev/uccm_gps
 """
@@ -47,12 +47,12 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, Tuple
 
-# Linux-Konstanten fuer serielle DCD-Abfrage
+# Linux constants for serial DCD query
 _TIOCMGET = getattr(termios, 'TIOCMGET', 0x5415)
-_TIOCM_CD = 0x040  # DCD-Bit im Modem-Status
+_TIOCM_CD = 0x040  # DCD bit in modem status
 
 # ---------------------------------------------------------------------------
-# NMEA-Hilfsfunktionen
+# NMEA helper functions
 # ---------------------------------------------------------------------------
 
 def nmea_checksum(body: str) -> str:
@@ -79,14 +79,14 @@ def deg_to_nmea_lon(deg: float) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# NTP Shared Memory (Typ 28, identisch mit uccm_bridge.py)
+# NTP Shared Memory (type 28)
 # ---------------------------------------------------------------------------
 
 class ShmTime(ctypes.Structure):
-    # Struktur entspricht ntpd/refclock_shm.c ohne NSec-Felder (96 Bytes auf 64-Bit).
-    # Die NSec-Felder wurden in neueren ntpd-Versionen hinzugefuegt, sind auf
-    # diesem System aber nicht vorhanden (ipcs zeigt 96 Bytes fuer ntpd-Segmente).
-    # mode=0 → ntpd liest clockTimeStampSec/USec; NSec nicht benoetigt.
+    # Structure matches ntpd/refclock_shm.c without NSec fields (96 bytes on 64-bit).
+    # The NSec fields were added in newer ntpd versions but are not present on
+    # this system (ipcs shows 96 bytes for ntpd segments).
+    # mode=0 → ntpd reads clockTimeStampSec/USec; NSec not needed.
     _fields_ = [
         ('mode',                   ctypes.c_int),
         ('count',                  ctypes.c_int),
@@ -98,7 +98,7 @@ class ShmTime(ctypes.Structure):
         ('precision',              ctypes.c_int),
         ('nsamples',               ctypes.c_int),
         ('valid',                  ctypes.c_int),
-        ('dummy',                  ctypes.c_int * 11),  # padding auf 96 Bytes
+        ('dummy',                  ctypes.c_int * 11),  # padding to 96 bytes
     ]
 
 
@@ -130,7 +130,7 @@ class NtpShm:
             errno = ctypes.get_errno()
             raise OSError(errno, os.strerror(errno))
         self.shm_ptr = ctypes.cast(ctypes.c_void_p(ptr), ctypes.POINTER(ShmTime))
-        logging.info(f"NTP SHM Unit {self.unit} geoeffnet (key=0x{key:08x})")
+        logging.info(f"NTP SHM Unit {self.unit} opened (key=0x{key:08x})")
 
     def write(self, gps_time: datetime, recv_time: Optional[datetime] = None,
               precision: int = -1):
@@ -144,7 +144,7 @@ class NtpShm:
         gps_s, gps_us   = int(gps_e),  int((gps_e  - int(gps_e))  * 1e6)
         recv_s, recv_us = int(recv_e), int((recv_e - int(recv_e)) * 1e6)
         shm.valid = 0
-        shm.count += 1                       # Ungerade = Schreibvorgang laeuft
+        shm.count += 1                       # Odd = write in progress
         shm.clockTimeStampSec    = gps_s
         shm.clockTimeStampUSec   = gps_us
         shm.receiveTimeStampSec  = recv_s
@@ -152,7 +152,7 @@ class NtpShm:
         shm.leap      = 0
         shm.precision = precision
         shm.mode      = 0
-        shm.count    += 1                    # Gerade = Schreibvorgang abgeschlossen
+        shm.count    += 1                    # Even = write complete
         shm.valid     = 1
 
     def close(self):
@@ -162,7 +162,7 @@ class NtpShm:
 
 
 # ---------------------------------------------------------------------------
-# PTY-Verwaltung (identisch mit uccm_bridge.py)
+# PTY management
 # ---------------------------------------------------------------------------
 
 class GpsdPty:
@@ -174,7 +174,7 @@ class GpsdPty:
     def open(self):
         master_fd, slave_fd = pty.openpty()
         slave_path = os.ttyname(slave_fd)
-        # Raw-Modus
+        # Raw mode
         attrs = termios.tcgetattr(slave_fd)
         attrs[0] = 0
         attrs[1] = 0
@@ -189,15 +189,15 @@ class GpsdPty:
         os.symlink(slave_path, self.symlink_path)
         self.master_fd = master_fd
         self.slave_fd  = slave_fd
-        logging.info(f"PTY erstellt: {slave_path} -> {self.symlink_path}")
-        logging.info(f"gpsd starten mit: gpsd -n {self.symlink_path}")
+        logging.info(f"PTY created: {slave_path} -> {self.symlink_path}")
+        logging.info(f"Start gpsd with: gpsd -n {self.symlink_path}")
 
     def write(self, data: bytes):
         if self.master_fd is not None:
             try:
                 os.write(self.master_fd, data)
             except OSError as e:
-                logging.warning(f"PTY-Schreibfehler: {e}")
+                logging.warning(f"PTY write error: {e}")
 
     def close(self):
         for fd in (self.master_fd, self.slave_fd):
@@ -212,29 +212,29 @@ class GpsdPty:
 
 
 # ---------------------------------------------------------------------------
-# UCCM SCPI-Client mit Demultiplexer-Thread
+# UCCM SCPI client with demultiplexer thread
 # ---------------------------------------------------------------------------
 
 import queue as _queue
 
-# TOD-Paket: Zeile beginnt mit "c5 " gefolgt von 43 weiteren Hex-Bytes.
-# Achtung: UCCM-CLI haengt bei Gleichzeitigkeit das SCPI-Echo an die TOD-Zeile
-# (z.B. "c5 00 ... ca TIME:STRing?" Laenge 144 statt 131).
-# Deshalb: nur Zeilenbeginn pruefen, Rest wird separat als SCPI eingereiht.
+# TOD packet: line starts with "c5 " followed by 43 more hex bytes.
+# Note: UCCM-CLI may append the SCPI echo to the TOD line under concurrency
+# (e.g. "c5 00 ... ca TIME:STRing?" length 144 instead of 131).
+# Therefore: only check the start of the line; the rest is queued as SCPI.
 _TOD_RE = re.compile(r'^(c5(?:\s+[0-9a-f]{2}){43})(.*)', re.IGNORECASE | re.DOTALL)
 
-_SENTINEL = object()  # Queue-Abbruch-Signal
+_SENTINEL = object()  # Queue termination sentinel
 
 
 # ---------------------------------------------------------------------------
-# Serieller Transport (Alternative zu TCP-Socket)
+# Serial transport (alternative to TCP socket)
 # ---------------------------------------------------------------------------
 
 class _SerialTransport:
     """
-    Seriell-Transport fuer UccmScpiClient.
-    Duck-Type-kompatibel mit socket.socket (recv, sendall, fileno, close).
-    Ermoeglicht 1PPS-Erkennung via DCD-Pin (read_dcd).
+    Serial transport for UccmScpiClient.
+    Duck-type compatible with socket.socket (recv, sendall, fileno, close).
+    Enables 1PPS detection via DCD pin (read_dcd).
     """
     _BAUD_CONSTS = {b: getattr(termios, f'B{b}', None)
                     for b in (1200, 2400, 4800, 9600, 19200, 38400,
@@ -248,19 +248,19 @@ class _SerialTransport:
     def connect(self):
         baud_c = self._BAUD_CONSTS.get(self.baud)
         if baud_c is None:
-            raise ValueError(f"Unbekannte Baudrate: {self.baud}")
+            raise ValueError(f"Unknown baud rate: {self.baud}")
         self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY)
         attrs = list(termios.tcgetattr(self.fd))
         attrs[0] = termios.IGNBRK                          # iflag
         attrs[1] = 0                                       # oflag
         attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag
-        attrs[3] = 0                                       # lflag: kein Echo, non-canonical
+        attrs[3] = 0                                       # lflag: no echo, non-canonical
         attrs[4] = baud_c                                  # ispeed
         attrs[5] = baud_c                                  # ospeed
-        attrs[6][termios.VMIN]  = 1                        # blockieren bis 1 Byte da
+        attrs[6][termios.VMIN]  = 1                        # block until 1 byte available
         attrs[6][termios.VTIME] = 0
         termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
-        logging.info(f"Serieller Port geoeffnet: {self.device} @ {self.baud} Baud")
+        logging.info(f"Serial port opened: {self.device} @ {self.baud} baud")
 
     def recv(self, n: int) -> bytes:
         return os.read(self.fd, n)
@@ -275,10 +275,10 @@ class _SerialTransport:
         return self.fd
 
     def settimeout(self, _t):
-        pass  # Seriell: Timeout wird via select gesteuert
+        pass  # Serial: timeout is controlled via select
 
     def read_dcd(self) -> bool:
-        """Liefert True wenn DCD-Pin gesetzt (1PPS-Puls erkannt)."""
+        """Returns True when DCD pin is asserted (1PPS pulse detected)."""
         buf = bytearray(4)
         fcntl.ioctl(self.fd, _TIOCMGET, buf)
         return bool(int.from_bytes(buf, sys.byteorder) & _TIOCM_CD)
@@ -294,14 +294,14 @@ class _SerialTransport:
 
 class UccmScpiClient:
     """
-    SCPI-Client mit einem einzigen Lese-Thread (Demultiplexer).
+    SCPI client with a single reader thread (demultiplexer).
 
-    Der Reader-Thread liest kontinuierlich vom Socket und verteilt Zeilen auf:
-      _scpi_queue  <- SCPI-Antworten (ASCII-Text, "Command Complete")
-      _tod_queue   <- TOD-Pakete (hex-kodierte Binaerpakete, 44 Bytes)
+    The reader thread continuously reads from the socket and distributes lines to:
+      _scpi_queue  <- SCPI responses (ASCII text, "Command Complete")
+      _tod_queue   <- TOD packets (hex-encoded binary packets, 44 bytes)
 
-    query()          liest aus _scpi_queue (Thread-sicher)
-    recv_tod_packet() liest aus _tod_queue (Thread-sicher)
+    query()           reads from _scpi_queue (thread-safe)
+    recv_tod_packet() reads from _tod_queue (thread-safe)
     """
 
     def __init__(self, host: str, port: int, timeout: float = 10.0):
@@ -314,31 +314,31 @@ class UccmScpiClient:
         self._tod_queue:  _queue.Queue = _queue.Queue(maxsize=8)
         self._reader: Optional[threading.Thread] = None
         self._connected = False
-        self._query_lock = threading.Lock()  # serialisiert gleichzeitige query()-Aufrufe
+        self._query_lock = threading.Lock()  # serializes concurrent query() calls
 
     # ------------------------------------------------------------------
-    # Verbindung
+    # Connection
     # ------------------------------------------------------------------
 
     def connect(self):
-        """TCP-Verbindung herstellen."""
+        """Establish TCP connection."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
         self.sock.connect((self.host, self.port))
-        self.sock.settimeout(None)  # Reader-Thread blockiert selbst
+        self.sock.settimeout(None)  # reader thread blocks itself
         self._connected = True
         self._start_reader()
         self._drain_scpi(2.0)
-        logging.info(f"SCPI-Verbunden mit {self.host}:{self.port}")
+        logging.info(f"SCPI connected to {self.host}:{self.port}")
 
     def connect_serial(self, transport: '_SerialTransport'):
-        """Serielle Verbindung herstellen (Alternative zu TCP)."""
+        """Establish serial connection (alternative to TCP)."""
         transport.connect()
         self.sock = transport  # duck typing: recv/sendall/fileno/close
         self._connected = True
         self._start_reader()
         self._drain_scpi(2.0)
-        logging.info(f"SCPI-Verbunden (seriell) mit {transport.device}")
+        logging.info(f"SCPI connected (serial) to {transport.device}")
 
     def _start_reader(self):
         self._reader = threading.Thread(target=self._reader_loop,
@@ -359,23 +359,23 @@ class UccmScpiClient:
             except OSError:
                 pass
             self.sock = None
-        # Reader-Thread beendet sich durch das geschlossene Socket
+        # Reader thread exits when socket is closed
         if self._reader:
             self._reader.join(timeout=2.0)
-        # Queues mit Sentinel abschliessen
+        # Terminate queues with sentinel
         self._scpi_queue.put(_SENTINEL)
         self._tod_queue.put(_SENTINEL)
 
     # ------------------------------------------------------------------
-    # Demultiplexer-Thread (einziger Socket-Leser)
+    # Demultiplexer thread (sole socket reader)
     # ------------------------------------------------------------------
 
     def _reader_loop(self):
-        """Liest alle Socket-Daten, klassifiziert Zeilen, verteilt auf Queues."""
+        """Reads all socket data, classifies lines, distributes to queues."""
         buf = b''
         try:
             while self._connected:
-                # Blockierender Recv mit Timeout fuer sauberes Beenden
+                # Blocking recv with timeout for clean shutdown
                 ready = select.select([self.sock], [], [], 1.0)[0]
                 if not ready:
                     continue
@@ -392,7 +392,7 @@ class UccmScpiClient:
                         continue
                     m = _TOD_RE.match(line)
                     if m:
-                        # Gruppe 1: die 44 Hex-Bytes (131 Zeichen)
+                        # Group 1: the 44 hex bytes (131 characters)
                         tod_hex  = m.group(1)
                         leftover = m.group(2).strip()
                         raw = bytes(int(h, 16) for h in tod_hex.split())
@@ -404,7 +404,7 @@ class UccmScpiClient:
                             except _queue.Empty:
                                 pass
                             self._tod_queue.put_nowait((raw, recv_time))
-                        # Eventuelle SCPI-Reste (Befehlsecho) weiterleiten
+                        # Forward any SCPI remainder (command echo)
                         if leftover:
                             self._scpi_queue.put(leftover)
                     else:
@@ -415,14 +415,14 @@ class UccmScpiClient:
             self._connected = False
             self._scpi_queue.put(_SENTINEL)
             self._tod_queue.put(_SENTINEL)
-            logging.debug("SCPI-Reader-Thread beendet")
+            logging.debug("SCPI reader thread terminated")
 
     # ------------------------------------------------------------------
-    # SCPI-Kommunikation
+    # SCPI communication
     # ------------------------------------------------------------------
 
     def _drain_scpi(self, timeout: float):
-        """Verwirft alle aktuellen SCPI-Zeilen fuer `timeout` Sekunden."""
+        """Discards all pending SCPI lines for `timeout` seconds."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -435,8 +435,8 @@ class UccmScpiClient:
 
     def _collect_scpi_response(self, cmd: str, timeout: float) -> str:
         """
-        Liest SCPI-Zeilen aus der Queue bis 'Command Complete' erscheint.
-        Gibt bereinigten Antwort-Text zurueck.
+        Reads SCPI lines from the queue until 'Command Complete' appears.
+        Returns cleaned response text.
         """
         lines = []
         deadline = time.time() + timeout
@@ -448,11 +448,11 @@ class UccmScpiClient:
                 break
             if item is _SENTINEL:
                 self._scpi_queue.put(_SENTINEL)
-                raise ConnectionError("Verbindung geschlossen")
+                raise ConnectionError("Connection closed")
             line = item
             if '"Command Complete"' in line:
                 break
-            # Echo und Prompt herausfiltern
+            # Filter out echo and prompt
             if line == cmd.strip():
                 continue
             if line.startswith('UCCM>') or line == '':
@@ -461,22 +461,22 @@ class UccmScpiClient:
         return '\n'.join(lines).strip()
 
     def query(self, cmd: str, timeout: float = 3.0) -> str:
-        """Sendet SCPI-Befehl und gibt Antwort zurueck (Thread-sicher via Queue)."""
+        """Sends SCPI command and returns response (thread-safe via queue)."""
         with self._query_lock:
             self.sock.sendall((cmd + '\r\n').encode())
             return self._collect_scpi_response(cmd, timeout)
 
     # ------------------------------------------------------------------
-    # TOD-Datenstrom
+    # TOD data stream
     # ------------------------------------------------------------------
 
     def tod_enable(self):
-        """Aktiviert den TOD-Datenstrom."""
+        """Enables the TOD data stream."""
         self.sock.sendall(b'TOD EN\r\n')
-        # Bestaetigung abwarten
+        # Wait for acknowledgement
         self._collect_scpi_response('TOD EN', timeout=2.0)
         self._tod_enabled = True
-        logging.info("TOD-Datenstrom aktiviert (1PPS-Pakete kommen jetzt)")
+        logging.info("TOD data stream enabled (1PPS packets incoming)")
 
     def tod_disable(self):
         self.sock.sendall(b'TOD DI\r\n')
@@ -485,8 +485,8 @@ class UccmScpiClient:
 
     def recv_tod_packet(self, timeout: float = 2.0) -> Optional[Tuple[bytes, datetime]]:
         """
-        Wartet auf das naechste TOD-Paket aus der Queue.
-        Gibt (raw_bytes, recv_time) zurueck oder None bei Timeout/Fehler.
+        Waits for the next TOD packet from the queue.
+        Returns (raw_bytes, recv_time) or None on timeout/error.
         """
         try:
             item = self._tod_queue.get(timeout=timeout)
@@ -499,11 +499,11 @@ class UccmScpiClient:
 
 
 # ---------------------------------------------------------------------------
-# SCPI-Antwort-Parser
+# SCPI response parsers
 # ---------------------------------------------------------------------------
 
 def parse_time_string(resp: str) -> Optional[datetime]:
-    """Parst "YYYY/MM/DD HH:MM:SS" -> datetime (UTC)."""
+    """Parses "YYYY/MM/DD HH:MM:SS" -> datetime (UTC)."""
     m = re.search(r'(\d{4})/(\d{2})/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})', resp)
     if not m:
         return None
@@ -516,7 +516,7 @@ def parse_time_string(resp: str) -> Optional[datetime]:
 
 def parse_position(resp: str) -> Optional[Tuple[float, float, float]]:
     """
-    Parst "N,+49,+18,+51.668,E,+6,+56,+21.080,+315.12"
+    Parses "N,+49,+18,+51.668,E,+6,+56,+21.080,+315.12"
     -> (lat_deg, lon_deg, alt_m)
     """
     m = re.search(
@@ -547,12 +547,12 @@ def parse_gps_lock(resp: str) -> bool:
 
 
 def parse_prn_list(resp: str) -> list:
-    """Parst "+12,+18,+22,..." -> [12, 18, 22, ...]"""
+    """Parses "+12,+18,+22,..." -> [12, 18, 22, ...]"""
     return [int(m) for m in re.findall(r'[+-]?(\d+)', resp)]
 
 
 def parse_system_status(resp: str) -> dict:
-    """Extrahiert ANT-Spannung und Temperatur aus SYSTEM:STATUS?-Antwort."""
+    """Extracts ANT voltage, current, and temperature from SYSTEM:STATUS? response."""
     result = {}
     m = re.search(r'ANT V=([\d.]+V),\s*I=([\d.]+mA)', resp)
     if m:
@@ -565,7 +565,7 @@ def parse_system_status(resp: str) -> dict:
 
 
 def parse_tod_seconds_bcd(pkt: bytes) -> Optional[int]:
-    """Extrahiert Sekunden (BCD) aus Byte 30 des TOD-Pakets."""
+    """Extracts seconds (BCD) from byte 30 of the TOD packet."""
     if len(pkt) < 31 or pkt[0] != 0xC5:
         return None
     bcd = pkt[30]
@@ -577,7 +577,7 @@ def parse_tod_seconds_bcd(pkt: bytes) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
-# NMEA-Generator
+# NMEA generator
 # ---------------------------------------------------------------------------
 
 class NmeaGenerator:
@@ -604,7 +604,7 @@ class NmeaGenerator:
             self.prns = prns[:]
 
     def generate(self, now: datetime) -> list:
-        """Erzeugt NMEA-Saetze fuer den gegebenen UTC-Zeitpunkt."""
+        """Generates NMEA sentences for the given UTC timestamp."""
         with self._lock:
             lat, lon, alt = self.lat, self.lon, self.alt
             sats   = self.num_sats
@@ -613,7 +613,7 @@ class NmeaGenerator:
 
         status   = 'A' if locked else 'V'
         fix_qual = '1' if locked else '0'
-        fix_type = '3' if locked else '1'  # GPGSA: 1=no fix, 2=2D, 3=3D
+        fix_type = '3' if locked else '1'  # GPGSA: 1=no fix, 2=2D fix, 3=3D fix
 
         tstr = f"{now.hour:02d}{now.minute:02d}{now.second:02d}.00"
         dstr = f"{now.day:02d}{now.month:02d}{now.year % 100:02d}"
@@ -623,35 +623,35 @@ class NmeaGenerator:
 
         sentences = []
 
-        # $GPRMC  (Cycle-Starter laut gpsd)
+        # $GPRMC  (cycle starter per gpsd)
         sentences.append(build_nmea(
             'GPRMC', tstr, status,
             lat_s, lat_h, lon_s, lon_h,
             '0.000', '0.00', dstr, '', '', 'A'
         ))
 
-        # $GPZDA  (praeziseste Zeitquelle fuer NTP; muss vor GPGGA kommen,
-        #          da gpsd GPGGA als Cycle-Ender behandelt)
+        # $GPZDA  (most precise time source for NTP; must come before GPGGA
+        #          because gpsd treats GPGGA as the cycle ender)
         sentences.append(build_nmea(
             'GPZDA', tstr,
             f"{now.day:02d}", f"{now.month:02d}", f"{now.year:04d}",
             '00', '00'
         ))
 
-        # $GPGSA  (aktive Satelliten + Fix-Typ; gpsmon zeigt PRN-Liste)
-        # Bis zu 12 PRNs, restliche Felder leer auffuellen
+        # $GPGSA  (active satellites + fix type; gpsmon shows PRN list)
+        # Up to 12 PRNs; fill remaining fields with empty strings
         prn_fields = [f"{p:02d}" for p in prns[:12]] + [''] * max(0, 12 - len(prns))
         sentences.append(build_nmea('GPGSA', 'A', fix_type, *prn_fields, '', '', ''))
 
-        # $GPGSV wird bewusst nicht erzeugt:
-        # Das UCCM-SCPI-Interface liefert keine Azimut/Elevation/SNR-Daten.
-        # gpsd 3.25 prueft auf der letzten GPGSV-Nachricht, ob mindestens ein
-        # Azimut != 0 ist (SiRFstar-Workaround, driver_nmea0183.c:2296).
-        # Mit allen Azimuten = 0 (atoi("") = 0) loggt gpsd
-        # "Satellite data no good" und verwirft die Daten.
-        # GPGSA liefert die PRN-Liste fuer gpsmon ohne diesen Fehler.
+        # $GPGSV is intentionally not generated:
+        # The UCCM SCPI interface provides no azimuth/elevation/SNR data.
+        # gpsd 3.25 checks whether at least one azimuth != 0 on the last GPGSV
+        # message (SiRFstar workaround, driver_nmea0183.c:2296).
+        # With all azimuths = 0 (atoi("") = 0) gpsd logs
+        # "Satellite data no good" and discards the data.
+        # GPGSA provides the PRN list for gpsmon without this error.
 
-        # $GPGGA  (Cycle-Ender laut gpsd)
+        # $GPGGA  (cycle ender per gpsd)
         sentences.append(build_nmea(
             'GPGGA', tstr,
             lat_s, lat_h, lon_s, lon_h,
@@ -663,11 +663,11 @@ class NmeaGenerator:
 
 
 # ---------------------------------------------------------------------------
-# Bridge-Status (thread-sicher, fuer Web-Interface)
+# Bridge status (thread-safe, for web interface)
 # ---------------------------------------------------------------------------
 
 class BridgeStatus:
-    """Thread-sichere Statusablage fuer das Web-Interface."""
+    """Thread-safe status store for the web interface."""
 
     def __init__(self, pps_source_cfg: str):
         self._lock = threading.Lock()
@@ -704,7 +704,7 @@ class BridgeStatus:
 
 _HTML_TEMPLATE = """\
 <!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>UCCM GPS Bridge</title>
@@ -733,13 +733,13 @@ _HTML_TEMPLATE = """\
 </head>
 <body>
 <h1>Samsung UCCM GPS Bridge</h1>
-<table id="tbl"><tr><td>Lade ...</td></tr></table>
+<table id="tbl"><tr><td>Loading...</td></tr></table>
 <div id="ts"></div>
 
-<h2>Diagnose-Log</h2>
+<h2>Diagnostic Log</h2>
 <div class="log-btns">
-  <button onclick="loadLog()">Log laden</button>
-  <button class="danger" onclick="clearLog()">Log l\u00f6schen</button>
+  <button onclick="loadLog()">Load Log</button>
+  <button class="danger" onclick="clearLog()">Clear Log</button>
 </div>
 <div id="log-status"></div>
 <pre id="log-out"></pre>
@@ -751,57 +751,57 @@ async function refresh() {
     const r = await fetch('/status');
     const d = await r.json();
     const rows = [
-      ['Verbindung',   d.connected   ? '<span class="ok">Verbunden</span>' : '<span class="err">Getrennt</span>'],
+      ['Connection',   d.connected   ? '<span class="ok">Connected</span>' : '<span class="err">Disconnected</span>'],
       ['GPS Lock',     d.gps_locked  ? '<span class="ok">Locked</span>'    : '<span class="err">Unlocked</span>'],
-      ['GPS-Zeit',     fmt(d.last_gps_time)],
+      ['GPS Time',     fmt(d.last_gps_time)],
       ['Position',     d.lat !== null ? `${d.lat.toFixed(6)} / ${d.lon.toFixed(6)} / ${d.alt.toFixed(1)} m` : '\u2013'],
-      ['Satelliten',   d.num_sats + (d.prns.length ? ' (PRNs: ' + d.prns.join(', ') + ')' : '')],
+      ['Satellites',   d.num_sats + (d.prns.length ? ' (PRNs: ' + d.prns.join(', ') + ')' : '')],
       ['TFOM',         fmt(d.tfom)],
-      ['ANT-Spannung', fmt(d.ant_voltage)],
-      ['ANT-Strom',    fmt(d.ant_current)],
-      ['Temperatur',   fmt(d.temperature)],
-      ['1PPS-Quelle',  fmt(d.pps_source)],
-      ['Letzter PPS',  fmt(d.last_pps_time)],
-      ['Bridge-Start', fmt(d.started_at)],
+      ['ANT Voltage',  fmt(d.ant_voltage)],
+      ['ANT Current',  fmt(d.ant_current)],
+      ['Temperature',  fmt(d.temperature)],
+      ['1PPS Source',  fmt(d.pps_source)],
+      ['Last PPS',     fmt(d.last_pps_time)],
+      ['Bridge Start', fmt(d.started_at)],
     ];
     document.getElementById('tbl').innerHTML =
       rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join('');
     document.getElementById('ts').textContent =
-      'Aktualisiert: ' + new Date().toISOString();
+      'Updated: ' + new Date().toISOString();
   } catch(e) {
-    document.getElementById('ts').textContent = 'Fehler: ' + e;
+    document.getElementById('ts').textContent = 'Error: ' + e;
   }
 }
 
 async function loadLog() {
   const st = document.getElementById('log-status');
   const out = document.getElementById('log-out');
-  st.textContent = 'Lade Log ...';
+  st.textContent = 'Loading log...';
   try {
     const r = await fetch('/log');
     const d = await r.json();
-    if (d.error) { st.textContent = 'Fehler: ' + d.error; return; }
-    out.textContent = d.lines.length ? d.lines.join('\\n') : '(Log ist leer)';
+    if (d.error) { st.textContent = 'Error: ' + d.error; return; }
+    out.textContent = d.lines.length ? d.lines.join('\\n') : '(Log is empty)';
     out.style.display = 'block';
-    st.textContent = d.lines.length + ' Eintr\u00e4ge \u2013 ' + new Date().toISOString();
+    st.textContent = d.lines.length + ' entries \u2013 ' + new Date().toISOString();
   } catch(e) {
-    st.textContent = 'Fehler: ' + e;
+    st.textContent = 'Error: ' + e;
   }
 }
 
 async function clearLog() {
-  if (!confirm('Diagnose-Log wirklich l\u00f6schen?')) return;
+  if (!confirm('Really clear the diagnostic log?')) return;
   const st = document.getElementById('log-status');
-  st.textContent = 'L\u00f6sche Log ...';
+  st.textContent = 'Clearing log...';
   try {
     const r = await fetch('/log/clear', {method: 'POST'});
     const d = await r.json();
-    if (d.error) { st.textContent = 'Fehler: ' + d.error; return; }
+    if (d.error) { st.textContent = 'Error: ' + d.error; return; }
     document.getElementById('log-out').textContent = '';
     document.getElementById('log-out').style.display = 'none';
-    st.textContent = 'Log gel\u00f6scht \u2013 ' + new Date().toISOString();
+    st.textContent = 'Log cleared \u2013 ' + new Date().toISOString();
   } catch(e) {
-    st.textContent = 'Fehler: ' + e;
+    st.textContent = 'Error: ' + e;
   }
 }
 
@@ -814,9 +814,9 @@ setInterval(refresh, 2000);
 
 
 class _WebHandler(BaseHTTPRequestHandler):
-    """HTTP-Handler fuer Bridge-Status."""
+    """HTTP handler for bridge status."""
 
-    # Klassenattribute werden von WebServer gesetzt
+    # Class attributes set by WebServer
     status: 'BridgeStatus' = None
     get_client = None  # Callable[[], Optional[UccmScpiClient]]
 
@@ -835,7 +835,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         elif path == '/log':
             client = self.get_client()
             if client is None:
-                self._json_response({'error': 'Nicht verbunden'}, 503)
+                self._json_response({'error': 'Not connected'}, 503)
                 return
             try:
                 raw = client.query('DIAGNOSTIC:LOG:READ:ALL?', timeout=10.0)
@@ -862,7 +862,7 @@ class _WebHandler(BaseHTTPRequestHandler):
         if path == '/log/clear':
             client = self.get_client()
             if client is None:
-                self._json_response({'error': 'Nicht verbunden'}, 503)
+                self._json_response({'error': 'Not connected'}, 503)
                 return
             try:
                 client.query('DIAGNOSTIC:LOG:CLEAR', timeout=5.0)
@@ -877,7 +877,7 @@ class _WebHandler(BaseHTTPRequestHandler):
 
 
 class WebServer:
-    """Startet einen HTTP-Server in einem Daemon-Thread."""
+    """Starts an HTTP server in a daemon thread."""
 
     def __init__(self, port: int, status: BridgeStatus, get_client):
         self.port       = port
@@ -886,7 +886,7 @@ class WebServer:
         self._srv: Optional[HTTPServer] = None
 
     def start(self):
-        # Handler-Klasse pro Instanz ableiten, damit status sauber gesetzt ist
+        # Derive handler class per instance so that status is set cleanly
         handler = type('_H', (_WebHandler,),
                        {'status': self.status,
                         'get_client': staticmethod(self.get_client)})
@@ -894,7 +894,7 @@ class WebServer:
         t = threading.Thread(target=self._srv.serve_forever,
                              name='web', daemon=True)
         t.start()
-        logging.info(f"Web-Interface: http://0.0.0.0:{self.port}/")
+        logging.info(f"Web interface: http://0.0.0.0:{self.port}/")
 
     def stop(self):
         if self._srv:
@@ -903,27 +903,27 @@ class WebServer:
 
 
 # ---------------------------------------------------------------------------
-# Haupt-Bridge
+# Main bridge
 # ---------------------------------------------------------------------------
 
 class UccmScpiBridge:
     """
-    Verbindet UCCM SCPI -> gpsd-PTY + NTP-SHM.
+    Bridges UCCM SCPI -> gpsd PTY + NTP SHM.
 
-    Architektur (Single-Thread-Polling + optionaler TOD-Thread):
-      Haupt-Thread: SCPI-Polling (TIME:STRing?, GPS:POSition?, ...) @ 1 Hz
-      TOD-Thread:   TOD-Paket-Empfang fuer praezises 1PPS-Timing (optional)
+    Architecture (single-thread polling + optional TOD thread):
+      Main thread: SCPI polling (TIME:STRing?, GPS:POSition?, ...) @ 1 Hz
+      TOD thread:  TOD packet reception for precise 1PPS timing (optional)
     """
 
     def __init__(self, args):
         self.host            = args.host
         self.port            = args.port
-        self.serial_device   = args.serial       # None → TCP-Modus
+        self.serial_device   = args.serial       # None → TCP mode
         self.serial_baud     = args.baud
         self.pty_path        = args.pty
         self.reconnect_delay = args.reconnect_delay
         self.use_shm         = args.ntp_shm
-        # --no-tod ist ein Alias fuer --pps-source none (Rueckwaertskompatibilitaet)
+        # --no-tod is an alias for --pps-source none (backwards compatibility)
         self.pps_source      = 'none' if args.no_tod else args.pps_source
         self.web_port        = args.web_port
         self.running         = False
@@ -937,7 +937,7 @@ class UccmScpiBridge:
         self._status                       = BridgeStatus(self.pps_source)
         self._web: Optional[WebServer]     = None
 
-    # --- Lifecycle ---
+    # --- Lifecycle ----------------------------------------------------------
 
     def start(self):
         self.running = True
@@ -950,7 +950,7 @@ class UccmScpiBridge:
                     shm = NtpShm(unit=unit)
                     setattr(self, attr, shm)
                 except OSError as e:
-                    logging.warning(f"NTP SHM Unit {unit} nicht verfuegbar: {e}")
+                    logging.warning(f"NTP SHM Unit {unit} not available: {e}")
 
         if self.web_port:
             self._web = WebServer(self.web_port, self._status,
@@ -974,7 +974,7 @@ class UccmScpiBridge:
     def wait(self):
         self._thread.join()
 
-    # --- Haupt-Schleife ---
+    # --- Main loop ----------------------------------------------------------
 
     def _main_loop(self):
         while self.running:
@@ -985,13 +985,13 @@ class UccmScpiBridge:
                 self._scpi_client = client
                 self._run_session(client)
             except Exception as e:
-                logging.error(f"Session-Fehler: {e}")
+                logging.error(f"Session error: {e}")
             finally:
                 self._scpi_client = None
                 client.close()
                 self._status.update(connected=False)
             if self.running:
-                logging.info(f"Verbindung unterbrochen. Reconnect in "
+                logging.info(f"Connection lost. Reconnecting in "
                              f"{self.reconnect_delay}s...")
                 time.sleep(self.reconnect_delay)
 
@@ -999,56 +999,56 @@ class UccmScpiBridge:
         while self.running:
             try:
                 if self.serial_device:
-                    logging.info(f"Verbinde SCPI via seriell: {self.serial_device} "
-                                 f"@ {self.serial_baud} Baud ...")
+                    logging.info(f"Connecting SCPI via serial: {self.serial_device} "
+                                 f"@ {self.serial_baud} baud...")
                     c = UccmScpiClient(self.serial_device, 0)
                     t = _SerialTransport(self.serial_device, self.serial_baud)
                     c.connect_serial(t)
                 else:
-                    logging.info(f"Verbinde SCPI zu {self.host}:{self.port} ...")
+                    logging.info(f"Connecting SCPI to {self.host}:{self.port}...")
                     c = UccmScpiClient(self.host, self.port)
                     c.connect()
                 self._status.update(connected=True)
                 return c
             except OSError as e:
                 self._status.update(connected=False)
-                logging.warning(f"Verbindung fehlgeschlagen: {e}. "
-                                f"Retry in {self.reconnect_delay}s ...")
+                logging.warning(f"Connection failed: {e}. "
+                                f"Retry in {self.reconnect_delay}s...")
                 time.sleep(self.reconnect_delay)
         return None
 
-    # --- Session ---
+    # --- Session ------------------------------------------------------------
 
     def _run_session(self, client: UccmScpiClient):
-        """Fuehrt eine SCPI-Session durch: initiales Setup + Polling-Loop."""
+        """Runs a SCPI session: initial setup + polling loop."""
 
-        # Geraet identifizieren
+        # Identify device
         idn = client.query('*IDN?', timeout=3)
         logging.info(f"UCCM IDN: {idn.strip()!r}")
 
-        # Initiale Position holen
+        # Fetch initial position
         self._update_position(client)
         self._update_status(client)
 
-        # 1PPS-Thread: Quelle per --pps-source bestimmen
-        # 'auto': TCP→TOD, seriell→DCD  |  'tod': TOD  |  'dcd': DCD  |  'none': kein 1PPS
+        # 1PPS thread: determine source via --pps-source
+        # 'auto': TCP→TOD, serial→DCD  |  'tod': TOD  |  'dcd': DCD  |  'none': no 1PPS
         pps_thread = None
         effective_pps = self.pps_source
         if effective_pps == 'auto':
             effective_pps = 'dcd' if self.serial_device else 'tod'
         if effective_pps == 'dcd' and not self.serial_device:
-            logging.warning("--pps-source=dcd erfordert --serial; 1PPS deaktiviert")
+            logging.warning("--pps-source=dcd requires --serial; 1PPS disabled")
             effective_pps = 'none'
 
         if effective_pps != 'none' and self._shm1:
             if effective_pps == 'dcd':
-                logging.info("1PPS-Quelle: DCD-Pin")
+                logging.info("1PPS source: DCD pin")
                 pps_thread = threading.Thread(
                     target=self._dcd_loop, args=(client.sock,),
                     name='dcd-pps', daemon=True
                 )
             else:  # tod
-                logging.info("1PPS-Quelle: TOD-Datenstrom")
+                logging.info("1PPS source: TOD data stream")
                 client.tod_enable()
                 self._tod_client = client
                 pps_thread = threading.Thread(
@@ -1057,55 +1057,55 @@ class UccmScpiBridge:
                 )
             pps_thread.start()
 
-        # Polling-Loop: 1x pro Sekunde TIME:STRing? + periodisch GPS-Daten
+        # Polling loop: TIME:STRing? once per second + periodic GPS data
         poll_cycle  = 0
         last_second = -1
 
         while self.running:
             t_start = time.time()
 
-            # Uhrzeit abfragen
+            # Query time
             try:
                 resp = client.query('TIME:STRing?', timeout=3)
             except Exception as e:
-                raise ConnectionError(f"TIME:STRing? fehlgeschlagen: {e}")
+                raise ConnectionError(f"TIME:STRing? failed: {e}")
 
             recv_time = datetime.now(timezone.utc)
             gps_time  = parse_time_string(resp)
 
             if gps_time is None:
-                logging.warning(f"Ungueltige TIME:STRing-Antwort: {resp!r}")
+                logging.warning(f"Invalid TIME:STRing response: {resp!r}")
                 time.sleep(0.5)
                 continue
 
-            # Nur einmal pro Sekunde NMEA erzeugen
+            # Generate NMEA only once per second
             if gps_time.second != last_second:
                 last_second = gps_time.second
-                logging.debug(f"GPS-Zeit: {gps_time.isoformat()} "
-                              f"(Empfang: {recv_time.isoformat()})")
+                logging.debug(f"GPS time: {gps_time.isoformat()} "
+                              f"(received: {recv_time.isoformat()})")
                 self._status.update(last_gps_time=gps_time.isoformat())
 
-                # NMEA erzeugen und in PTY schreiben
+                # Generate NMEA and write to PTY
                 sentences = self._nmea.generate(gps_time)
                 for s in sentences:
                     self._pty.write(s)
                     logging.debug(f"NMEA: {s.decode().strip()}")
 
-                # NTP SHM0 (NMEA-Timing)
+                # NTP SHM0 (NMEA timing)
                 if self._shm0:
                     self._shm0.write(gps_time, recv_time, precision=-1)
                     logging.debug(f"NTP SHM0: {gps_time.isoformat()}")
 
-            # Periodische Abfragen (jede 30. Sekunde)
+            # Periodic queries (every 30th cycle)
             poll_cycle += 1
             if poll_cycle % 30 == 0 or poll_cycle == 1:
                 try:
                     self._update_position(client)
                     self._update_status(client)
                 except Exception as e:
-                    logging.warning(f"Periodische Abfrage fehlgeschlagen: {e}")
+                    logging.warning(f"Periodic query failed: {e}")
 
-            # Genau 1 Sekunde Abstand halten
+            # Maintain exactly 1 second interval
             elapsed = time.time() - t_start
             sleep_s = max(0, 1.0 - elapsed)
             time.sleep(sleep_s)
@@ -1115,57 +1115,57 @@ class UccmScpiBridge:
 
     def _tod_loop(self, client: UccmScpiClient):
         """
-        Empfaengt TOD-Pakete in einem separaten Thread.
-        Nutzt den Ankunftszeitpunkt des Pakets als 1PPS-Referenz.
+        Receives TOD packets in a separate thread.
+        Uses the packet arrival time as the 1PPS reference.
         """
-        logging.info("TOD-Thread gestartet")
+        logging.info("TOD thread started")
         while self.running and self._tod_client is client:
             result = client.recv_tod_packet(timeout=2.0)
             if result is None:
                 continue
             pkt, recv_time = result
             sec_bcd = parse_tod_seconds_bcd(pkt)
-            logging.debug(f"TOD-Paket empfangen (Sekunde BCD="
+            logging.debug(f"TOD packet received (second BCD="
                           f"{'None' if sec_bcd is None else f'{sec_bcd:#04x}'}), "
-                          f"Empfang: {recv_time.isoformat()}")
+                          f"received: {recv_time.isoformat()}")
 
-            # GPS-Zeit fuer SHM1: naechste volle Sekunde (das ist die angekuendigte)
-            # Wir verwenden die Sekunde des Empfangszeitpunkts (gerundet)
+            # GPS time for SHM1: next full second (the announced one)
+            # We use the second of the reception timestamp (rounded)
             gps_sec = recv_time.replace(microsecond=0)
             self._status.update(last_pps_time=recv_time.isoformat())
             if self._shm1:
                 self._shm1.write(gps_sec, recv_time, precision=-9)
                 logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
 
-        logging.info("TOD-Thread beendet")
+        logging.info("TOD thread terminated")
 
     def _dcd_loop(self, transport: '_SerialTransport'):
         """
-        1PPS via DCD-Pin des seriellen Ports (serieller Modus).
-        Erkennt steigende DCD-Flanke und schreibt Zeitstempel in NTP SHM1.
+        1PPS via DCD pin of the serial port (serial mode).
+        Detects rising DCD edge and writes timestamp to NTP SHM1.
         """
-        logging.info("DCD-1PPS-Thread gestartet")
+        logging.info("DCD 1PPS thread started")
         last_dcd = False
         while self.running:
             try:
                 dcd = transport.read_dcd()
             except OSError as e:
-                logging.warning(f"DCD-Lesefehler: {e}")
+                logging.warning(f"DCD read error: {e}")
                 time.sleep(0.1)
                 continue
-            # Steigende Flanke: DCD geht von Low auf High
+            # Rising edge: DCD transitions from low to high
             if dcd and not last_dcd:
                 recv_time = datetime.now(timezone.utc)
                 gps_sec   = recv_time.replace(microsecond=0)
                 self._status.update(last_pps_time=recv_time.isoformat())
                 if self._shm1:
                     self._shm1.write(gps_sec, recv_time, precision=-9)
-                    logging.debug(f"NTP SHM1 (DCD-1PPS): {gps_sec.isoformat()}")
+                    logging.debug(f"NTP SHM1 (DCD 1PPS): {gps_sec.isoformat()}")
             last_dcd = dcd
-            time.sleep(0.001)  # 1ms Polling
-        logging.info("DCD-1PPS-Thread beendet")
+            time.sleep(0.001)  # 1 ms polling
+        logging.info("DCD 1PPS thread terminated")
 
-    # --- Hilfsmethoden ---
+    # --- Helper methods -----------------------------------------------------
 
     def _update_position(self, client: UccmScpiClient):
         resp = client.query('GPS:POSition?', timeout=3)
@@ -1174,9 +1174,9 @@ class UccmScpiBridge:
             lat, lon, alt = pos
             self._nmea.update_position(lat, lon, alt)
             self._status.update(lat=round(lat, 7), lon=round(lon, 7), alt=round(alt, 2))
-            logging.info(f"Position: {lat:+.6f} {lon:+.6f} Alt={alt:.1f}m")
+            logging.info(f"Position: {lat:+.6f} {lon:+.6f} alt={alt:.1f}m")
         else:
-            logging.warning(f"Position nicht parsebar: {resp!r}")
+            logging.warning(f"Position not parseable: {resp!r}")
 
     def _update_status(self, client: UccmScpiClient):
         try:
@@ -1194,72 +1194,72 @@ class UccmScpiBridge:
             self._nmea.update_satellites(prns)
             self._status.update(num_sats=sats, prns=prns, gps_locked=locked,
                                 tfom=tfom, **sys_st)
-            logging.info(f"Status: {sats} Satelliten, PRNs={prns}, Lock={locked}, "
+            logging.info(f"Status: {sats} satellites, PRNs={prns}, lock={locked}, "
                          f"TFOM={tfom!r}, {sys_st}")
         except Exception as e:
-            logging.warning(f"Status-Abfrage fehlgeschlagen: {e}")
+            logging.warning(f"Status query failed: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Signal-Handler & Argument-Parser
+# Signal handler & argument parser
 # ---------------------------------------------------------------------------
 
 def make_signal_handler(bridge: UccmScpiBridge):
     def handler(sig, frame):
-        logging.info(f"Signal {sig} empfangen, beende ...")
+        logging.info(f"Signal {sig} received, shutting down...")
         bridge.stop()
     return handler
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Samsung UCCM SCPI-Bridge: TCP/Seriell SCPI -> PTY (gpsd) + NTP SHM',
+        description='Samsung UCCM SCPI bridge: TCP/serial SCPI -> PTY (gpsd) + NTP SHM',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
-            'Verbindung (eines erforderlich):\n'
-            '  TCP:     HOST PORT                   (z.B. 172.16.20.30 2000)\n'
-            '  Seriell: --serial /dev/ttyUSB0\n'
+            'Connection (one required):\n'
+            '  TCP:    HOST PORT                   (e.g. 172.16.20.30 2000)\n'
+            '  Serial: --serial /dev/ttyUSB0\n'
             '\n'
-            '1PPS-Quelle (--pps-source):\n'
-            '  auto  TCP→TOD-Pakete, seriell→DCD-Pin  (Standard)\n'
-            '  tod   TOD-Datenstrom (TCP und seriell)\n'
-            '  dcd   DCD-Pin        (nur seriell)\n'
-            '  none  kein 1PPS\n'
+            '1PPS source (--pps-source):\n'
+            '  auto  TCP→TOD packets, serial→DCD pin  (default)\n'
+            '  tod   TOD data stream (TCP and serial)\n'
+            '  dcd   DCD pin         (serial only)\n'
+            '  none  no 1PPS\n'
         )
     )
-    # Transport: TCP (positional) oder seriell (--serial), gegenseitig exklusiv
+    # Transport: TCP (positional) or serial (--serial), mutually exclusive
     parser.add_argument('host', nargs='?', default=None,
-                        help='Hostname/IP des UCCM fuer TCP-Verbindung')
+                        help='Hostname/IP of the UCCM for TCP connection')
     parser.add_argument('port', nargs='?', type=int, default=None,
-                        help='TCP-Port der UCCM-CLI (typisch: 2000)')
-    parser.add_argument('--serial', metavar='GERAET', default=None,
-                        help='Serielles Geraet statt TCP (z.B. /dev/ttyUSB0)')
+                        help='TCP port of the UCCM CLI (typically 2000)')
+    parser.add_argument('--serial', metavar='DEVICE', default=None,
+                        help='Serial device instead of TCP (e.g. /dev/ttyUSB0)')
     parser.add_argument('--baud', type=int, default=9600, metavar='BAUD',
-                        help='Baudrate fuer serielles Geraet')
+                        help='Baud rate for serial device')
     parser.add_argument('--pty', default='/dev/uccm_gps',
-                        help='PTY-Symlink-Pfad fuer gpsd')
+                        help='PTY symlink path for gpsd')
     parser.add_argument('--reconnect-delay', type=float, default=5.0,
-                        metavar='SEK')
+                        metavar='SEC')
     parser.add_argument('--ntp-shm', action='store_true',
-                        help='NTP SHM aktivieren (Unit 0=NMEA, Unit 1=1PPS)')
+                        help='Enable NTP SHM (Unit 0=NMEA, Unit 1=1PPS)')
     parser.add_argument('--pps-source', default='auto',
                         choices=['auto', 'tod', 'dcd', 'none'],
-                        help='1PPS-Quelle: auto|tod|dcd|none')
+                        help='1PPS source: auto|tod|dcd|none')
     parser.add_argument('--no-tod', action='store_true',
-                        help='1PPS deaktivieren (Alias fuer --pps-source none)')
+                        help='Disable 1PPS (alias for --pps-source none)')
     parser.add_argument('--web-port', type=int, default=0, metavar='PORT',
-                        help='HTTP-Status-Port (0 = deaktiviert, z.B. 8080)')
+                        help='HTTP status port (0 = disabled, e.g. 8080)')
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
 
-    # Validierung: entweder TCP oder seriell, nicht beides, nicht keines
+    # Validation: either TCP or serial, not both, not neither
     if args.serial:
         if args.host or args.port:
-            parser.error('--serial und HOST/PORT schliessen sich aus')
+            parser.error('--serial and HOST/PORT are mutually exclusive')
     else:
         if not args.host or args.port is None:
-            parser.error('HOST und PORT angeben oder --serial GERAET verwenden')
+            parser.error('provide HOST and PORT or use --serial DEVICE')
     return args
 
 
@@ -1276,14 +1276,14 @@ def main():
         signal.signal(sig, make_signal_handler(bridge))
 
     bridge.start()
-    logging.info(f"Bridge laeuft. PTY: {args.pty}")
+    logging.info(f"Bridge running. PTY: {args.pty}")
     if args.web_port:
-        logging.info(f"Web-Interface: http://localhost:{args.web_port}/")
+        logging.info(f"Web interface: http://localhost:{args.web_port}/")
     if args.ntp_shm:
-        logging.info("NTP SHM aktiv:")
+        logging.info("NTP SHM active:")
         logging.info("  server 127.127.28.0 minpoll 4 maxpoll 4    # NMEA")
         logging.info("  fudge  127.127.28.0 refid GPS")
-        logging.info("  server 127.127.28.1 minpoll 4 maxpoll 4 prefer  # TOD-1PPS")
+        logging.info("  server 127.127.28.1 minpoll 4 maxpoll 4 prefer  # TOD 1PPS")
         logging.info("  fudge  127.127.28.1 refid PPS")
 
     try:
@@ -1292,7 +1292,7 @@ def main():
         pass
     finally:
         bridge.stop()
-    logging.info("Bridge beendet.")
+    logging.info("Bridge stopped.")
 
 
 if __name__ == '__main__':
