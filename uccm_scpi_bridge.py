@@ -314,6 +314,7 @@ class UccmScpiClient:
         self._tod_queue:  _queue.Queue = _queue.Queue(maxsize=8)
         self._reader: Optional[threading.Thread] = None
         self._connected = False
+        self._query_lock = threading.Lock()  # serialisiert gleichzeitige query()-Aufrufe
 
     # ------------------------------------------------------------------
     # Verbindung
@@ -461,8 +462,9 @@ class UccmScpiClient:
 
     def query(self, cmd: str, timeout: float = 3.0) -> str:
         """Sendet SCPI-Befehl und gibt Antwort zurueck (Thread-sicher via Queue)."""
-        self.sock.sendall((cmd + '\r\n').encode())
-        return self._collect_scpi_response(cmd, timeout)
+        with self._query_lock:
+            self.sock.sendall((cmd + '\r\n').encode())
+            return self._collect_scpi_response(cmd, timeout)
 
     # ------------------------------------------------------------------
     # TOD-Datenstrom
@@ -693,6 +695,7 @@ _HTML_TEMPLATE = """\
 <style>
   body { font-family: monospace; background: #111; color: #ccc; margin: 2em; }
   h1   { color: #0af; }
+  h2   { color: #0af; font-size: 1em; margin-top: 2em; }
   table { border-collapse: collapse; margin-top: 1em; }
   td, th { padding: 0.3em 1.2em 0.3em 0; text-align: left; }
   th   { color: #888; font-weight: normal; }
@@ -700,12 +703,31 @@ _HTML_TEMPLATE = """\
   .err { color: #e44; }
   .warn{ color: #fa0; }
   #ts  { color: #555; font-size: 0.85em; margin-top: 1.5em; }
+  .log-btns { margin-top: 1.5em; }
+  .log-btns button { background: #222; color: #ccc; border: 1px solid #555;
+    padding: 0.3em 1em; cursor: pointer; margin-right: 0.5em; font-family: monospace; }
+  .log-btns button:hover { background: #333; }
+  .log-btns button.danger { border-color: #e44; color: #e44; }
+  .log-btns button.danger:hover { background: #300; }
+  #log-out { margin-top: 0.8em; white-space: pre-wrap; background: #1a1a1a;
+    border: 1px solid #333; padding: 0.8em; max-height: 20em; overflow-y: auto;
+    font-size: 0.9em; display: none; }
+  #log-status { color: #555; font-size: 0.85em; margin-top: 0.4em; }
 </style>
 </head>
 <body>
 <h1>Samsung UCCM GPS Bridge</h1>
 <table id="tbl"><tr><td>Lade ...</td></tr></table>
 <div id="ts"></div>
+
+<h2>Diagnose-Log</h2>
+<div class="log-btns">
+  <button onclick="loadLog()">Log laden</button>
+  <button class="danger" onclick="clearLog()">Log l\u00f6schen</button>
+</div>
+<div id="log-status"></div>
+<pre id="log-out"></pre>
+
 <script>
 function fmt(v) { return v === null || v === '' ? '\u2013' : v; }
 async function refresh() {
@@ -731,6 +753,39 @@ async function refresh() {
     document.getElementById('ts').textContent = 'Fehler: ' + e;
   }
 }
+
+async function loadLog() {
+  const st = document.getElementById('log-status');
+  const out = document.getElementById('log-out');
+  st.textContent = 'Lade Log ...';
+  try {
+    const r = await fetch('/log');
+    const d = await r.json();
+    if (d.error) { st.textContent = 'Fehler: ' + d.error; return; }
+    out.textContent = d.lines.length ? d.lines.join('\n') : '(Log ist leer)';
+    out.style.display = 'block';
+    st.textContent = d.lines.length + ' Eintr\u00e4ge \u2013 ' + new Date().toISOString();
+  } catch(e) {
+    st.textContent = 'Fehler: ' + e;
+  }
+}
+
+async function clearLog() {
+  if (!confirm('Diagnose-Log wirklich l\u00f6schen?')) return;
+  const st = document.getElementById('log-status');
+  st.textContent = 'L\u00f6sche Log ...';
+  try {
+    const r = await fetch('/log/clear', {method: 'POST'});
+    const d = await r.json();
+    if (d.error) { st.textContent = 'Fehler: ' + d.error; return; }
+    document.getElementById('log-out').textContent = '';
+    document.getElementById('log-out').style.display = 'none';
+    st.textContent = 'Log gel\u00f6scht \u2013 ' + new Date().toISOString();
+  } catch(e) {
+    st.textContent = 'Fehler: ' + e;
+  }
+}
+
 refresh();
 setInterval(refresh, 2000);
 </script>
@@ -742,18 +797,33 @@ setInterval(refresh, 2000);
 class _WebHandler(BaseHTTPRequestHandler):
     """HTTP-Handler fuer Bridge-Status."""
 
-    # Bridge-Status wird als Klassenattribut gesetzt (von WebServer)
+    # Klassenattribute werden von WebServer gesetzt
     status: 'BridgeStatus' = None
+    get_client = None  # Callable[[], Optional[UccmScpiClient]]
+
+    def _json_response(self, data, code: int = 200):
+        body = json.dumps(data, default=str).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         path = self.path.split('?')[0]
         if path == '/status':
-            body = json.dumps(self.status.snapshot(), default=str).encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._json_response(self.status.snapshot())
+        elif path == '/log':
+            client = self.get_client()
+            if client is None:
+                self._json_response({'error': 'Nicht verbunden'}, 503)
+                return
+            try:
+                raw = client.query('DIAGNOSTIC:LOG:READ:ALL?', timeout=10.0)
+                lines = [l for l in raw.splitlines() if l.strip()]
+                self._json_response({'lines': lines})
+            except Exception as e:
+                self._json_response({'error': str(e)}, 500)
         elif path in ('/', '/index.html'):
             body = _HTML_TEMPLATE.encode()
             self.send_response(200)
@@ -767,6 +837,21 @@ class _WebHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_POST(self):
+        path = self.path.split('?')[0]
+        if path == '/log/clear':
+            client = self.get_client()
+            if client is None:
+                self._json_response({'error': 'Nicht verbunden'}, 503)
+                return
+            try:
+                client.query('DIAGNOSTIC:LOG:CLEAR', timeout=5.0)
+                self._json_response({'ok': True})
+            except Exception as e:
+                self._json_response({'error': str(e)}, 500)
+        else:
+            self.send_error(404)
+
     def log_message(self, fmt, *args):  # noqa: A002
         logging.debug(f"HTTP {self.address_string()} {fmt % args}")
 
@@ -774,14 +859,16 @@ class _WebHandler(BaseHTTPRequestHandler):
 class WebServer:
     """Startet einen HTTP-Server in einem Daemon-Thread."""
 
-    def __init__(self, port: int, status: BridgeStatus):
-        self.port   = port
-        self.status = status
+    def __init__(self, port: int, status: BridgeStatus, get_client):
+        self.port       = port
+        self.status     = status
+        self.get_client = get_client  # Callable[[], Optional[UccmScpiClient]]
         self._srv: Optional[HTTPServer] = None
 
     def start(self):
         # Handler-Klasse pro Instanz ableiten, damit status sauber gesetzt ist
-        handler = type('_H', (_WebHandler,), {'status': self.status})
+        handler = type('_H', (_WebHandler,),
+                       {'status': self.status, 'get_client': self.get_client})
         self._srv = HTTPServer(('', self.port), handler)
         t = threading.Thread(target=self._srv.serve_forever,
                              name='web', daemon=True)
@@ -825,6 +912,7 @@ class UccmScpiBridge:
         self._nmea                         = NmeaGenerator()
         self._last_pos_time                = 0.0
         self._tod_client: Optional[UccmScpiClient] = None
+        self._scpi_client: Optional[UccmScpiClient] = None  # aktiver Client fuer Web-API
         self._status                       = BridgeStatus(self.pps_source)
         self._web: Optional[WebServer]     = None
 
@@ -844,7 +932,8 @@ class UccmScpiBridge:
                     logging.warning(f"NTP SHM Unit {unit} nicht verfuegbar: {e}")
 
         if self.web_port:
-            self._web = WebServer(self.web_port, self._status)
+            self._web = WebServer(self.web_port, self._status,
+                                  lambda: self._scpi_client)
             self._web.start()
 
         self._thread = threading.Thread(target=self._main_loop,
@@ -872,10 +961,12 @@ class UccmScpiBridge:
             if client is None:
                 break
             try:
+                self._scpi_client = client
                 self._run_session(client)
             except Exception as e:
                 logging.error(f"Session-Fehler: {e}")
             finally:
+                self._scpi_client = None
                 client.close()
                 self._status.update(connected=False)
             if self.running:
