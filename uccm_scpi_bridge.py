@@ -1163,13 +1163,14 @@ class UccmScpiBridge:
                     self._pty.write(s)
                     logging.debug(f"NMEA: {s.decode().strip()}")
 
-                # NTP SHM0 (coarse GPS second reference)
-                # When TOD is active, SHM0 is kept by the TOD thread which
-                # has a stable, small offset (~50 ms TOD-packet latency).
-                # Without TOD, use gps_time as both timestamps so the
-                # reported offset is 0 (honest to ±0.5 s precision) rather
-                # than -(variable SCPI latency) which causes NTP falseticker.
-                if self._shm0 and self._tod_client is None:
+                # NTP SHM0: coarse GPS-second reference.
+                # Use gps_time as BOTH clockTime and receiveTime → offset = 0.
+                # This is honest for a 1-second-precision source (precision=-1
+                # = ±0.5 s) and avoids reporting variable SCPI or TOD-packet
+                # latency as a clock offset, which would cause NTP jitter /
+                # falseticker.  SHM0 is always written here; the TOD thread
+                # is responsible for SHM1 (PPS) only.
+                if self._shm0:
                     self._shm0.write(gps_time, gps_time, precision=-1)
                     logging.debug(f"NTP SHM0: {gps_time.isoformat()}")
 
@@ -1206,15 +1207,13 @@ class UccmScpiBridge:
                           f"{'None' if sec_bcd is None else f'{sec_bcd:#04x}'}), "
                           f"received: {recv_time.isoformat()}")
 
-            # GPS second from TOD packet: use receive-time rounded to second.
-            # The TOD packet arrives within ~50 ms of the PPS edge, so the
-            # offset (gps_sec – recv_time ≈ –50 ms) is small and stable.
+            # GPS second from TOD packet arrival time.
+            # TOD packets arrive anywhere from 10–700 ms after the PPS edge
+            # (device-dependent); this variable latency is the unavoidable
+            # jitter for a software TCP PPS source.  SHM0 (coarse reference)
+            # is managed by the polling loop; here we only update SHM1.
             gps_sec = recv_time.replace(microsecond=0)
             self._status.update(last_pps_time=recv_time.isoformat())
-            # SHM0: coarse second reference (stable TOD latency, no SCPI jitter)
-            if self._shm0:
-                self._shm0.write(gps_sec, recv_time, precision=-1)
-                logging.debug(f"NTP SHM0 (TOD): {gps_sec.isoformat()}")
             if self._shm1:
                 self._shm1.write(gps_sec, recv_time, precision=-9)
                 logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
