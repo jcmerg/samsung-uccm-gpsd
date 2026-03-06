@@ -1215,6 +1215,7 @@ class UccmScpiBridge:
             # a second boundary (e.g. recv_time=22:16:20.998 while the packet
             # announces second 21).  Correct by ±1 s when sec_bcd disagrees.
             gps_sec = recv_time.replace(microsecond=0)
+            bcd_ok = True
             if sec_bcd is not None and gps_sec.second != sec_bcd:
                 delta = (sec_bcd - gps_sec.second) % 60
                 if delta == 1:          # packet arrived just before the announced second
@@ -1224,10 +1225,22 @@ class UccmScpiBridge:
                 else:
                     logging.warning(f"TOD BCD second {sec_bcd} far from "
                                     f"recv_time second {gps_sec.second}, ignoring")
+                    bcd_ok = False
             self._status.update(last_pps_time=recv_time.isoformat())
             if self._shm1:
-                self._shm1.write(gps_sec, recv_time, precision=-9)
-                logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
+                # Skip SHM1 write if the packet is stale (BCD mismatch) or if
+                # recv_time is too far past gps_sec – a large delay (e.g. due
+                # to high system load causing Python scheduling latency) would
+                # produce an NTP offset that triggers a falseticker.
+                pps_delay = (recv_time - gps_sec).total_seconds()
+                if not bcd_ok:
+                    logging.debug("TOD SHM1 skipped: stale BCD")
+                elif pps_delay > 0.700:
+                    logging.warning(f"TOD recv delay {pps_delay:.3f}s too large, "
+                                    f"skipping SHM1 (falseticker prevention)")
+                else:
+                    self._shm1.write(gps_sec, recv_time, precision=-9)
+                    logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
 
         logging.info("TOD thread terminated")
 

@@ -23,6 +23,11 @@ RestartSec=10
 KillSignal=SIGTERM
 TimeoutStopSec=10
 
+# Realtime-Scheduling: verhindert Scheduling-Verzoegerungen unter Last,
+# die recv_time verwaessern und NTP-Falseticker verursachen koennen.
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=10
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=uccm-scpi-bridge
