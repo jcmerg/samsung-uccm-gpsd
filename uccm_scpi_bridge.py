@@ -545,20 +545,13 @@ class NmeaGenerator:
         prn_fields = [f"{p:02d}" for p in prns[:12]] + [''] * max(0, 12 - len(prns))
         sentences.append(build_nmea('GPGSA', 'A', fix_type, *prn_fields, '', '', ''))
 
-        # $GPGSV  (Satelliten in Sichtweite; gpsmon zeigt Signalbalken)
-        # UCCM liefert keine Elevation/Azimut/SNR, daher leer.
-        # Je Satz max. 4 Satelliten.
-        if prns:
-            total_sats = len(prns)
-            total_msgs = (total_sats + 3) // 4
-            for msg_num, i in enumerate(range(0, total_sats, 4), 1):
-                chunk = prns[i:i + 4]
-                sat_fields = []
-                for prn in chunk:
-                    sat_fields.extend([f"{prn:02d}", '', '', ''])
-                sentences.append(build_nmea(
-                    'GPGSV', total_msgs, msg_num, f"{total_sats:02d}", *sat_fields
-                ))
+        # $GPGSV wird bewusst nicht erzeugt:
+        # Das UCCM-SCPI-Interface liefert keine Azimut/Elevation/SNR-Daten.
+        # gpsd 3.25 prueft auf der letzten GPGSV-Nachricht, ob mindestens ein
+        # Azimut != 0 ist (SiRFstar-Workaround, driver_nmea0183.c:2296).
+        # Mit allen Azimuten = 0 (atoi("") = 0) loggt gpsd
+        # "Satellite data no good" und verwirft die Daten.
+        # GPGSA liefert die PRN-Liste fuer gpsmon ohne diesen Fehler.
 
         # $GPGGA  (Cycle-Ender laut gpsd)
         sentences.append(build_nmea(
