@@ -554,9 +554,10 @@ def parse_prn_list(resp: str) -> list:
 def parse_system_status(resp: str) -> dict:
     """Extrahiert ANT-Spannung und Temperatur aus SYSTEM:STATUS?-Antwort."""
     result = {}
-    m = re.search(r'ANT V=([\d.]+V)', resp)
+    m = re.search(r'ANT V=([\d.]+V),\s*I=([\d.]+mA)', resp)
     if m:
         result['ant_voltage'] = m.group(1)
+        result['ant_current'] = m.group(2)
     m = re.search(r'Temp\s*=\s*([\d.]+)', resp)
     if m:
         result['temperature'] = m.group(1) + ' \u00b0C'
@@ -682,6 +683,7 @@ class BridgeStatus:
             'last_pps_time': None,   # ISO-String
             'tfom':         '',
             'ant_voltage':  None,
+            'ant_current':  None,
             'temperature':  None,
             'pps_source':   pps_source_cfg,
             'started_at':   datetime.now(timezone.utc).isoformat(),
@@ -756,6 +758,7 @@ async function refresh() {
       ['Satelliten',   d.num_sats + (d.prns.length ? ' (PRNs: ' + d.prns.join(', ') + ')' : '')],
       ['TFOM',         fmt(d.tfom)],
       ['ANT-Spannung', fmt(d.ant_voltage)],
+      ['ANT-Strom',    fmt(d.ant_current)],
       ['Temperatur',   fmt(d.temperature)],
       ['1PPS-Quelle',  fmt(d.pps_source)],
       ['Letzter PPS',  fmt(d.last_pps_time)],
