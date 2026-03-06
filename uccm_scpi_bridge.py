@@ -820,7 +820,8 @@ class _WebHandler(BaseHTTPRequestHandler):
                 return
             try:
                 raw = client.query('DIAGNOSTIC:LOG:READ:ALL?', timeout=10.0)
-                lines = [l for l in raw.splitlines() if l.strip()]
+                lines = [l for l in raw.splitlines()
+                         if l.strip() and not l.startswith(('infohead[', 'head['))]
                 self._json_response({'lines': lines})
             except Exception as e:
                 self._json_response({'error': str(e)}, 500)
