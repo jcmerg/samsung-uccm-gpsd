@@ -764,7 +764,7 @@ async function loadLog() {
     if (d.error) { st.textContent = 'Fehler: ' + d.error; return; }
     out.textContent = d.lines.length ? d.lines.join('\\n') : '(Log ist leer)';
     out.style.display = 'block';
-    st.textContent = d.lines.length + ' Eintr\u00e4ge \u2013 ' + new Date().toISOString();
+    st.textContent = 'Geladen: ' + new Date().toISOString();
   } catch(e) {
     st.textContent = 'Fehler: ' + e;
   }
