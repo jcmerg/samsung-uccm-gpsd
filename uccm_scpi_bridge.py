@@ -1166,17 +1166,17 @@ class UccmScpiBridge:
                     logging.debug(f"NMEA: {s.decode().strip()}")
 
                 # NTP SHM0: coarse GPS-second reference.
-                # clockTime  = GPS whole second from TIME:STRing?
-                # receiveTime = actual system time after SCPI response
-                # offset = clockTime - receiveTime ≈ -(SCPI round-trip)
-                # This is the standard NMEA-refclock approach: receiveTime
-                # must be a real, recent system-clock reading so ntpd does
-                # not reject the sample as "stale/bad receive time".
-                # The ~300 ms systematic offset is stable; configure
-                # "fudge SHM(0) time1 0.3" in ntp.conf if needed.
+                # TIME:STRing? returns the time for the NEXT GPS second
+                # (i.e. the time that will be valid at the upcoming PPS
+                # tick – standard GPS receiver behaviour).  At recv_time
+                # the *current* GPS second is therefore gps_time - 1 s.
+                # With that correction the SHM0 offset becomes
+                #   offset = (gps_time - 1) - recv_time ≈ -(SCPI RTT)
+                # which is a small, stable negative value (~-20 ms).
                 if self._shm0:
-                    self._shm0.write(gps_time, recv_time, precision=-1)
-                    logging.debug(f"NTP SHM0: {gps_time.isoformat()}")
+                    shm0_time = gps_time - timedelta(seconds=1)
+                    self._shm0.write(shm0_time, recv_time, precision=-1)
+                    logging.debug(f"NTP SHM0: {shm0_time.isoformat()}")
 
             # Periodic queries (every 30th cycle)
             poll_cycle += 1
