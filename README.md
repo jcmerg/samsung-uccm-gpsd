@@ -12,8 +12,9 @@ via NTP SHM (Referenzuhr Typ 28).
 Samsung UCCM GPS
         | TCP Port 2000 (SCPI-CLI)
 uccm_scpi_bridge.py
-  ├── SCPI-Polling (TIME:STRing?, GPS:POSition?, ...)
-  ├── TOD-Datenstrom (1PPS-Pakete via TOD EN, 1x/s)
+  ├── SCPI-Polling (TIME:STRing?, GPS:POSition?, ...)  ── 1 Hz
+  ├── TOD-Datenstrom (1PPS-Pakete via TOD EN)          ── 1x/s
+  ├── Log-Abfragen (separate TCP-Verbindung)           ── auf Anfrage
   ├── PTY /dev/uccm_gps  ──────► gpsd ──► GPS-Clients
   └── NTP SHM Unit 0/1   ──────► ntpd / chrony
 ```
@@ -24,20 +25,24 @@ uccm_scpi_bridge.py
 Samsung UCCM GPS
         | /dev/ttyUSB0 (seriell, SCPI-CLI)
 uccm_scpi_bridge.py
-  ├── SCPI-Polling (TIME:STRing?, GPS:POSition?, ...)
-  ├── DCD-Pin-Polling (1PPS via steigende Flanke)
+  ├── SCPI-Polling (TIME:STRing?, GPS:POSition?, ...)  ── 1 Hz
+  ├── DCD-Pin-Polling (1PPS via steigende Flanke)      ── 1 ms Intervall
   ├── PTY /dev/uccm_gps  ──────► gpsd ──► GPS-Clients
   └── NTP SHM Unit 0/1   ──────► ntpd / chrony
 ```
 
 ### 1PPS-Quellen (`--pps-source`)
 
-| `--pps-source` | TCP-Modus          | Serieller Modus        | SHM Unit 1 |
-|----------------|--------------------|------------------------|------------|
-| `auto`         | TOD-Pakete         | DCD-Pin                | ~1 µs      |
-| `tod`          | TOD-Pakete         | TOD-Pakete             | ~1 µs      |
-| `dcd`          | — (Warnung)        | DCD-Pin                | ~1 µs      |
-| `none`         | kein 1PPS          | kein 1PPS              | inaktiv    |
+| `--pps-source` | TCP-Modus          | Serieller Modus        | Typischer Jitter SHM1 |
+|----------------|--------------------|------------------------|-----------------------|
+| `auto`         | TOD-Pakete         | DCD-Pin                | TCP: 100–700 ms / DCD: ~1 ms |
+| `tod`          | TOD-Pakete         | TOD-Pakete             | TCP: 100–700 ms / seriell: ~5 ms |
+| `dcd`          | — (Warnung)        | DCD-Pin                | ~1 ms                 |
+| `none`         | kein 1PPS          | kein 1PPS              | inaktiv               |
+
+**Empfehlung:** Fuer PPS-Qualitaet (< 10 ms Jitter) seriellen Modus mit `auto`
+(= DCD-Pin, 1 ms Polling) verwenden. TOD ueber TCP unterliegt TCP-Netzwerkjitter
+und ist als primaere PPS-Quelle fuer NTP nicht empfehlenswert.
 
 `--no-tod` ist ein Alias fuer `--pps-source none` (Rueckwaertskompatibilitaet).
 
@@ -104,11 +109,14 @@ sudo ./uccm_scpi_bridge.py --ntp-shm 192.168.1.100 2000
 # TCP-Modus ohne 1PPS
 sudo ./uccm_scpi_bridge.py --ntp-shm --pps-source none 192.168.1.100 2000
 
-# Serieller Modus, 1PPS via DCD-Pin (Standard)
+# Serieller Modus, 1PPS via DCD-Pin (Standard, geringster Jitter)
 sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --baud 9600
 
 # Serieller Modus, 1PPS via TOD-Datenstrom statt DCD
 sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --pps-source tod
+
+# Mit Web-Interface
+sudo ./uccm_scpi_bridge.py --ntp-shm --web-port 8080 192.168.1.100 2000
 
 # Alle Optionen
 ./uccm_scpi_bridge.py --help
@@ -156,14 +164,35 @@ ipcrm -M 0x4e545030 -M 0x4e545031 2>/dev/null
 sudo systemctl restart uccm-scpi-bridge
 ```
 
+### NTP SHM Timing
+
+| SHM Unit | Inhalt | clockTime | receiveTime | Offset |
+|----------|--------|-----------|-------------|--------|
+| 0 (GPS)  | GPS-Sekunde (TIME:STRing?) | GPS-Sekunde (ganz) | Systemzeit nach SCPI-Antwort | ≈ −(SCPI-Latenz, ~200–400 ms) |
+| 1 (PPS)  | TOD-Paket oder DCD-Flanke | GPS-Sekunde (BCD) | Systemzeit bei Empfang | abhaengig von Quelle (s.u.) |
+
+**SHM0 (GPS NMEA):** Der Offset ist negativ und entspricht der SCPI-Abfragelatenz
+(typisch 200–400 ms). NTP erlernt diesen Wert automatisch. Optional kann er mit
+`fudge time1` kompensiert werden — den genauen Wert aus `ntpq -p` (Spalte
+`offset`) ablesen und mit umgekehrtem Vorzeichen eintragen.
+
+**SHM1 (1PPS):** Der Jitter haengt von der PPS-Quelle ab:
+
+| PPS-Quelle | Jitter | Empfehlung |
+|------------|--------|------------|
+| DCD seriell | ~1 ms | Empfohlen als primaere PPS-Quelle |
+| TOD seriell | ~5 ms | Akzeptabel; UART-Uebertragung ist deterministisch |
+| TOD TCP | 100–700 ms | Nicht als primaere PPS-Quelle empfohlen |
+
 ### ntpd (`/etc/ntp.conf`)
 
 ```
-# GPS NMEA (SHM Unit 0) - ~100ms Genauigkeit
+# GPS NMEA (SHM Unit 0) - Grobgenauigkeit ~0,5 s, Offset durch SCPI-Latenz
 server 127.127.28.0 minpoll 4 maxpoll 4
-fudge  127.127.28.0 refid GPS time1 0.0
+fudge  127.127.28.0 refid GPS time1 0.3
+# time1: gemessenen offset-Wert aus "ntpq -p" mit umgekehrtem Vorzeichen eintragen
 
-# 1PPS via TOD/DCD (SHM Unit 1) - ~1µs Genauigkeit
+# 1PPS via TOD/DCD (SHM Unit 1) - Feingenauigkeit (DCD/TOD seriell empfohlen)
 server 127.127.28.1 minpoll 4 maxpoll 4 prefer
 fudge  127.127.28.1 refid PPS
 ```
@@ -171,10 +200,11 @@ fudge  127.127.28.1 refid PPS
 ### chrony (`/etc/chrony.conf`)
 
 ```
-# GPS NMEA (SHM 0)
-refclock SHM 0 refid GPS precision 1e-1 offset 0.0 poll 4
+# GPS NMEA (SHM 0) - offset: gemessenen Wert aus "chronyc sources" anpassen
+refclock SHM 0 refid GPS precision 1e-1 offset 0.3 poll 4
+# offset: positiver Wert = SCPI-Latenz in Sekunden (typisch 0.2-0.4)
 
-# 1PPS via TOD/DCD (SHM 1)
+# 1PPS via TOD/DCD (SHM 1) - DCD oder TOD seriell empfohlen
 refclock SHM 1 refid PPS precision 1e-9 prefer poll 4
 ```
 
@@ -215,6 +245,9 @@ und geloescht werden:
 
 - **Log laden** – liest das Log via `DIAGNOSTIC:LOG:READ:ALL?`
 - **Log loeschen** – loescht das Log via `DIAGNOSTIC:LOG:CLEAR`
+
+Im TCP-Modus laufen Log-Operationen ueber eine **separate TCP-Verbindung**,
+sodass der SCPI-Polling-Loop (und damit NTP SHM) nicht unterbrochen wird.
 
 ### HTTP-API
 
@@ -282,12 +315,16 @@ allen Azimuten = 0 als ungueltig ablehnen (SiRFstar-Workaround).
 | `SYSTEM:STATUS?` | Mehrzeiliger Statusblock (ANT, Temp, ...) | alle 30 s |
 | `DIAGNOSTIC:LOG:READ:ALL?` | Zeilenweise Log-Eintraege | auf Anfrage (Web-UI) |
 | `DIAGNOSTIC:LOG:CLEAR` | — | auf Anfrage (Web-UI) |
-| `TOD EN` / `TOD DI` | - | einmalig beim Start (`--pps-source tod`) |
+| `TOD EN` / `TOD DI` | — | einmalig beim Start (`--pps-source tod`) |
 
 ### TOD-Pakete (1PPS via `--pps-source tod`)
 
 44 Bytes binaer, hex-kodiert in ASCII, ein Paket pro Sekunde.
-Sync-Byte: `0xC5`. Byte 30 enthaelt die Sekunde im BCD-Format.
+Sync-Byte: `0xC5`. Byte 30 enthaelt die Sekunde im BCD-Format (0x00–0x59).
+
+Die Bridge verwendet das BCD-Sekundenfeld zur Plausibilitaetspruefung und
+korrigiert `gps_sec` um ±1 s, falls das Paket nahe an einer Sekundengrenze
+eingetroffen ist und `recv_time` auf die falsche Sekunde rundet.
 
 ## Lizenz
 

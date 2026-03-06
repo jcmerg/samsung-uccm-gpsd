@@ -12,8 +12,9 @@ via NTP SHM (reference clock type 28).
 Samsung UCCM GPS
         | TCP port 2000 (SCPI-CLI)
 uccm_scpi_bridge.py
-  ├── SCPI polling (TIME:STRing?, GPS:POSition?, ...)
-  ├── TOD data stream (1PPS packets via TOD EN, 1x/s)
+  ├── SCPI polling (TIME:STRing?, GPS:POSition?, ...)  ── 1 Hz
+  ├── TOD data stream (1PPS packets via TOD EN)        ── 1x/s
+  ├── Log queries (separate TCP connection)            ── on demand
   ├── PTY /dev/uccm_gps  ──────► gpsd ──► GPS clients
   └── NTP SHM Unit 0/1   ──────► ntpd / chrony
 ```
@@ -24,20 +25,24 @@ uccm_scpi_bridge.py
 Samsung UCCM GPS
         | /dev/ttyUSB0 (serial, SCPI-CLI)
 uccm_scpi_bridge.py
-  ├── SCPI polling (TIME:STRing?, GPS:POSition?, ...)
-  ├── DCD pin polling (1PPS via rising edge)
+  ├── SCPI polling (TIME:STRing?, GPS:POSition?, ...)  ── 1 Hz
+  ├── DCD pin polling (1PPS via rising edge)           ── 1 ms interval
   ├── PTY /dev/uccm_gps  ──────► gpsd ──► GPS clients
   └── NTP SHM Unit 0/1   ──────► ntpd / chrony
 ```
 
 ### 1PPS sources (`--pps-source`)
 
-| `--pps-source` | TCP mode           | Serial mode            | SHM Unit 1 |
-|----------------|--------------------|------------------------|------------|
-| `auto`         | TOD packets        | DCD pin                | ~1 µs      |
-| `tod`          | TOD packets        | TOD packets            | ~1 µs      |
-| `dcd`          | — (warning)        | DCD pin                | ~1 µs      |
-| `none`         | no 1PPS            | no 1PPS                | inactive   |
+| `--pps-source` | TCP mode           | Serial mode            | Typical SHM1 jitter |
+|----------------|--------------------|------------------------|---------------------|
+| `auto`         | TOD packets        | DCD pin                | TCP: 100–700 ms / DCD: ~1 ms |
+| `tod`          | TOD packets        | TOD packets            | TCP: 100–700 ms / serial: ~5 ms |
+| `dcd`          | — (warning)        | DCD pin                | ~1 ms               |
+| `none`         | no 1PPS            | no 1PPS                | inactive            |
+
+**Recommendation:** For PPS quality (< 10 ms jitter) use serial mode with `auto`
+(= DCD pin, 1 ms polling). TOD over TCP is subject to TCP network jitter and is
+not recommended as a primary PPS source for NTP.
 
 `--no-tod` is an alias for `--pps-source none` (backwards compatibility).
 
@@ -104,11 +109,14 @@ sudo ./uccm_scpi_bridge.py --ntp-shm 192.168.1.100 2000
 # TCP mode without 1PPS
 sudo ./uccm_scpi_bridge.py --ntp-shm --pps-source none 192.168.1.100 2000
 
-# Serial mode, 1PPS via DCD pin (default)
+# Serial mode, 1PPS via DCD pin (default, lowest jitter)
 sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --baud 9600
 
 # Serial mode, 1PPS via TOD data stream instead of DCD
 sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --pps-source tod
+
+# With web interface
+sudo ./uccm_scpi_bridge.py --ntp-shm --web-port 8080 192.168.1.100 2000
 
 # All options
 ./uccm_scpi_bridge.py --help
@@ -156,14 +164,39 @@ ipcrm -M 0x4e545030 -M 0x4e545031 2>/dev/null
 sudo systemctl restart uccm-scpi-bridge
 ```
 
+### NTP SHM timing
+
+| SHM Unit | Content | clockTime | receiveTime | Offset |
+|----------|---------|-----------|-------------|--------|
+| 0 (GPS)  | GPS second (TIME:STRing?) | GPS whole second | System time after SCPI response | ≈ −(SCPI latency, ~200–400 ms) |
+| 1 (PPS)  | TOD packet or DCD edge | GPS second (BCD) | System time at reception | depends on source (see below) |
+
+**SHM0 (GPS NMEA):** The offset is negative and equals the SCPI query latency
+(typically 200–400 ms). NTP learns this value automatically. Optionally it can
+be compensated with `fudge time1` — read the exact value from `ntpq -p`
+(column `offset`) and enter it with the opposite sign.
+
+**SHM1 (1PPS):** Jitter depends on the PPS source:
+
+| PPS source   | Jitter       | Recommendation |
+|--------------|--------------|----------------|
+| DCD serial   | ~1 ms        | Recommended as primary PPS source |
+| TOD serial   | ~5 ms        | Acceptable; UART transmission is deterministic |
+| TOD TCP      | 100–700 ms   | Not recommended as primary PPS source |
+
+The TOD over TCP jitter comes from TCP network buffering (Nagle algorithm,
+delayed ACKs) and variable device-side send timing. TOD over serial avoids
+network buffering; the remaining jitter is OS scheduling latency (~1–5 ms).
+
 ### ntpd (`/etc/ntp.conf`)
 
 ```
-# GPS NMEA (SHM Unit 0) - ~100 ms accuracy
+# GPS NMEA (SHM Unit 0) - coarse accuracy ~0.5 s, offset from SCPI latency
 server 127.127.28.0 minpoll 4 maxpoll 4
-fudge  127.127.28.0 refid GPS time1 0.0
+fudge  127.127.28.0 refid GPS time1 0.3
+# time1: set to the measured offset from "ntpq -p" with the opposite sign
 
-# 1PPS via TOD/DCD (SHM Unit 1) - ~1 µs accuracy
+# 1PPS via TOD/DCD (SHM Unit 1) - fine accuracy (serial DCD/TOD recommended)
 server 127.127.28.1 minpoll 4 maxpoll 4 prefer
 fudge  127.127.28.1 refid PPS
 ```
@@ -171,10 +204,11 @@ fudge  127.127.28.1 refid PPS
 ### chrony (`/etc/chrony.conf`)
 
 ```
-# GPS NMEA (SHM 0)
-refclock SHM 0 refid GPS precision 1e-1 offset 0.0 poll 4
+# GPS NMEA (SHM 0) - offset: adjust from measured value in "chronyc sources"
+refclock SHM 0 refid GPS precision 1e-1 offset 0.3 poll 4
+# offset: positive value = SCPI latency in seconds (typically 0.2–0.4)
 
-# 1PPS via TOD/DCD (SHM 1)
+# 1PPS via TOD/DCD (SHM 1) - serial DCD or TOD recommended
 refclock SHM 1 refid PPS precision 1e-9 prefer poll 4
 ```
 
@@ -214,6 +248,9 @@ The web interface allows fetching and clearing the internal UCCM diagnostic log:
 
 - **Load Log** — reads the log via `DIAGNOSTIC:LOG:READ:ALL?`
 - **Clear Log** — clears the log via `DIAGNOSTIC:LOG:CLEAR`
+
+In TCP mode, log operations use a **separate TCP connection** so the SCPI
+polling loop (and therefore NTP SHM timestamps) is not interrupted.
 
 ### HTTP API
 
@@ -281,12 +318,16 @@ all azimuths = 0 as invalid (SiRFstar workaround).
 | `SYSTEM:STATUS?` | Multi-line status block (ANT, temp, ...) | every 30 s |
 | `DIAGNOSTIC:LOG:READ:ALL?` | Log entries line by line | on demand (web UI) |
 | `DIAGNOSTIC:LOG:CLEAR` | — | on demand (web UI) |
-| `TOD EN` / `TOD DI` | - | once at startup (`--pps-source tod`) |
+| `TOD EN` / `TOD DI` | — | once at startup (`--pps-source tod`) |
 
 ### TOD packets (1PPS via `--pps-source tod`)
 
 44 bytes binary, hex-encoded in ASCII, one packet per second.
-Sync byte: `0xC5`. Byte 30 contains the second in BCD format.
+Sync byte: `0xC5`. Byte 30 contains the second in BCD format (0x00–0x59).
+
+The bridge uses the BCD seconds field for plausibility checking and corrects
+`gps_sec` by ±1 s if the packet arrived near a second boundary and
+`recv_time` would otherwise round to the wrong second.
 
 ## License
 
