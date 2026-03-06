@@ -764,7 +764,7 @@ async function loadLog() {
     if (d.error) { st.textContent = 'Fehler: ' + d.error; return; }
     out.textContent = d.lines.length ? d.lines.join('\\n') : '(Log ist leer)';
     out.style.display = 'block';
-    st.textContent = 'Geladen: ' + new Date().toISOString();
+    st.textContent = d.lines.length + ' Eintr\u00e4ge \u2013 ' + new Date().toISOString();
   } catch(e) {
     st.textContent = 'Fehler: ' + e;
   }
@@ -821,7 +821,7 @@ class _WebHandler(BaseHTTPRequestHandler):
             try:
                 raw = client.query('DIAGNOSTIC:LOG:READ:ALL?', timeout=10.0)
                 lines = [l for l in raw.splitlines()
-                         if l.strip() and not l.startswith(('infohead[', 'head['))]
+                         if l.strip() and not l.startswith(('infohead[', 'head[', 'Log count ='))]
                 self._json_response({'lines': lines})
             except Exception as e:
                 self._json_response({'error': str(e)}, 500)
