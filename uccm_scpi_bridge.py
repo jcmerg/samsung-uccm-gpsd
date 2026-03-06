@@ -691,15 +691,15 @@ _HTML_TEMPLATE = """\
 <meta charset="utf-8">
 <title>UCCM GPS Bridge</title>
 <style>
-  body {{ font-family: monospace; background: #111; color: #ccc; margin: 2em; }}
-  h1   {{ color: #0af; }}
-  table {{ border-collapse: collapse; margin-top: 1em; }}
-  td, th {{ padding: 0.3em 1.2em 0.3em 0; text-align: left; }}
-  th   {{ color: #888; font-weight: normal; }}
-  .ok  {{ color: #4c4; }}
-  .err {{ color: #e44; }}
-  .warn{{ color: #fa0; }}
-  #ts  {{ color: #555; font-size: 0.85em; margin-top: 1.5em; }}
+  body { font-family: monospace; background: #111; color: #ccc; margin: 2em; }
+  h1   { color: #0af; }
+  table { border-collapse: collapse; margin-top: 1em; }
+  td, th { padding: 0.3em 1.2em 0.3em 0; text-align: left; }
+  th   { color: #888; font-weight: normal; }
+  .ok  { color: #4c4; }
+  .err { color: #e44; }
+  .warn{ color: #fa0; }
+  #ts  { color: #555; font-size: 0.85em; margin-top: 1.5em; }
 </style>
 </head>
 <body>
@@ -707,22 +707,16 @@ _HTML_TEMPLATE = """\
 <table id="tbl"><tr><td>Lade ...</td></tr></table>
 <div id="ts"></div>
 <script>
-function cls(v, ok, warn) {{
-  if (v === null || v === undefined) return 'warn';
-  if (ok  !== undefined && v === ok)   return 'ok';
-  if (warn !== undefined && v === warn) return 'warn';
-  return 'err';
-}}
-function fmt(v) {{ return v === null || v === '' ? '–' : v; }}
-async function refresh() {{
-  try {{
+function fmt(v) { return v === null || v === '' ? '\u2013' : v; }
+async function refresh() {
+  try {
     const r = await fetch('/status');
     const d = await r.json();
     const rows = [
       ['Verbindung',   d.connected   ? '<span class="ok">Verbunden</span>' : '<span class="err">Getrennt</span>'],
       ['GPS Lock',     d.gps_locked  ? '<span class="ok">Locked</span>'    : '<span class="err">Unlocked</span>'],
       ['GPS-Zeit',     fmt(d.last_gps_time)],
-      ['Position',     d.lat !== null ? `${{d.lat.toFixed(6)}} / ${{d.lon.toFixed(6)}} / ${{d.alt.toFixed(1)}} m` : '–'],
+      ['Position',     d.lat !== null ? `${d.lat.toFixed(6)} / ${d.lon.toFixed(6)} / ${d.alt.toFixed(1)} m` : '\u2013'],
       ['Satelliten',   d.num_sats + (d.prns.length ? ' (PRNs: ' + d.prns.join(', ') + ')' : '')],
       ['TFOM',         fmt(d.tfom)],
       ['1PPS-Quelle',  fmt(d.pps_source)],
@@ -730,13 +724,13 @@ async function refresh() {{
       ['Bridge-Start', fmt(d.started_at)],
     ];
     document.getElementById('tbl').innerHTML =
-      rows.map(([k, v]) => `<tr><th>${{k}}</th><td>${{v}}</td></tr>`).join('');
+      rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join('');
     document.getElementById('ts').textContent =
       'Aktualisiert: ' + new Date().toISOString();
-  }} catch(e) {{
+  } catch(e) {
     document.getElementById('ts').textContent = 'Fehler: ' + e;
-  }}
-}}
+  }
+}
 refresh();
 setInterval(refresh, 2000);
 </script>
@@ -752,20 +746,24 @@ class _WebHandler(BaseHTTPRequestHandler):
     status: 'BridgeStatus' = None
 
     def do_GET(self):
-        if self.path == '/status':
+        path = self.path.split('?')[0]
+        if path == '/status':
             body = json.dumps(self.status.snapshot(), default=str).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path in ('/', '/index.html'):
+        elif path in ('/', '/index.html'):
             body = _HTML_TEMPLATE.encode()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif path == '/favicon.ico':
+            self.send_response(204)
+            self.end_headers()
         else:
             self.send_error(404)
 
