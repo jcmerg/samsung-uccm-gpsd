@@ -1,0 +1,35 @@
+[Unit]
+Description=Samsung UCCM GPS Bridge - SCPI direkt (TCP Port 2000 -> gpsd PTY + NTP SHM)
+After=network-online.target
+Wants=network-online.target
+Before=gpsd.service
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/bin/sleep 2
+
+# Anpassen: HOST und ggf. --pty, --no-tod
+ExecStart=/usr/local/bin/uccm_scpi_bridge.py \
+    --pty /dev/uccm_gps \
+    --ntp-shm \
+    --reconnect-delay 5 \
+    --log-level INFO \
+    192.168.1.100 \
+    2000
+
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uccm-scpi-bridge
+
+# Berechtigungen fuer SHM und PTY-Erstellung
+AmbientCapabilities=CAP_IPC_OWNER
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target
