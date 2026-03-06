@@ -461,6 +461,11 @@ def parse_gps_lock(resp: str) -> bool:
     return 'locked' in resp.lower()
 
 
+def parse_prn_list(resp: str) -> list:
+    """Parst "+12,+18,+22,..." -> [12, 18, 22, ...]"""
+    return [int(m) for m in re.findall(r'[+-]?(\d+)', resp)]
+
+
 def parse_tod_seconds_bcd(pkt: bytes) -> Optional[int]:
     """Extrahiert Sekunden (BCD) aus Byte 30 des TOD-Pakets."""
     if len(pkt) < 31 or pkt[0] != 0xC5:
@@ -484,6 +489,7 @@ class NmeaGenerator:
         self.alt = 0.0
         self.num_sats = 0
         self.locked   = False
+        self.prns: list = []
         self._lock    = threading.Lock()
 
     def update_position(self, lat: float, lon: float, alt: float):
@@ -495,15 +501,21 @@ class NmeaGenerator:
             self.num_sats = num_sats
             self.locked   = locked
 
+    def update_satellites(self, prns: list):
+        with self._lock:
+            self.prns = prns[:]
+
     def generate(self, now: datetime) -> list:
         """Erzeugt NMEA-Saetze fuer den gegebenen UTC-Zeitpunkt."""
         with self._lock:
             lat, lon, alt = self.lat, self.lon, self.alt
             sats   = self.num_sats
             locked = self.locked
+            prns   = self.prns[:]
 
         status   = 'A' if locked else 'V'
         fix_qual = '1' if locked else '0'
+        fix_type = '3' if locked else '1'  # GPGSA: 1=no fix, 2=2D, 3=3D
 
         tstr = f"{now.hour:02d}{now.minute:02d}{now.second:02d}.00"
         dstr = f"{now.day:02d}{now.month:02d}{now.year % 100:02d}"
@@ -527,6 +539,26 @@ class NmeaGenerator:
             f"{now.day:02d}", f"{now.month:02d}", f"{now.year:04d}",
             '00', '00'
         ))
+
+        # $GPGSA  (aktive Satelliten + Fix-Typ; gpsmon zeigt PRN-Liste)
+        # Bis zu 12 PRNs, restliche Felder leer auffuellen
+        prn_fields = [f"{p:02d}" for p in prns[:12]] + [''] * max(0, 12 - len(prns))
+        sentences.append(build_nmea('GPGSA', 'A', fix_type, *prn_fields, '', '', ''))
+
+        # $GPGSV  (Satelliten in Sichtweite; gpsmon zeigt Signalbalken)
+        # UCCM liefert keine Elevation/Azimut/SNR, daher leer.
+        # Je Satz max. 4 Satelliten.
+        if prns:
+            total_sats = len(prns)
+            total_msgs = (total_sats + 3) // 4
+            for msg_num, i in enumerate(range(0, total_sats, 4), 1):
+                chunk = prns[i:i + 4]
+                sat_fields = []
+                for prn in chunk:
+                    sat_fields.extend([f"{prn:02d}", '', '', ''])
+                sentences.append(build_nmea(
+                    'GPGSV', total_msgs, msg_num, f"{total_sats:02d}", *sat_fields
+                ))
 
         # $GPGGA  (Cycle-Ender laut gpsd)
         sentences.append(build_nmea(
@@ -746,12 +778,16 @@ class UccmScpiBridge:
     def _update_status(self, client: UccmScpiClient):
         try:
             sats_resp = client.query('GPS:SATellite:TRACking:COUNt?', timeout=3)
+            prn_resp  = client.query('GPS:SATellite:TRACking?', timeout=3)
             lock_resp = client.query('LED:GPSLock?', timeout=3)
             tfom_resp = client.query('SYNChronization:TFOMerit?', timeout=3)
             sats   = parse_sat_count(sats_resp)
+            prns   = parse_prn_list(prn_resp)
             locked = parse_gps_lock(lock_resp)
             self._nmea.update_status(sats, locked)
-            logging.info(f"Status: {sats} Satelliten, Lock={locked}, TFOM={tfom_resp.split(chr(10))[0].strip()!r}")
+            self._nmea.update_satellites(prns)
+            logging.info(f"Status: {sats} Satelliten, PRNs={prns}, Lock={locked}, "
+                         f"TFOM={tfom_resp.split(chr(10))[0].strip()!r}")
         except Exception as e:
             logging.warning(f"Status-Abfrage fehlgeschlagen: {e}")
 
