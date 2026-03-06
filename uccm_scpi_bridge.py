@@ -842,7 +842,8 @@ class UccmScpiBridge:
                 continue
             pkt, recv_time = result
             sec_bcd = parse_tod_seconds_bcd(pkt)
-            logging.debug(f"TOD-Paket empfangen (Sekunde BCD={sec_bcd:#04x}), "
+            logging.debug(f"TOD-Paket empfangen (Sekunde BCD="
+                          f"{'None' if sec_bcd is None else f'{sec_bcd:#04x}'}), "
                           f"Empfang: {recv_time.isoformat()}")
 
             # GPS-Zeit fuer SHM1: naechste volle Sekunde (das ist die angekuendigte)
