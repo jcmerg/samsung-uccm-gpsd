@@ -463,6 +463,16 @@ class UccmScpiClient:
     def query(self, cmd: str, timeout: float = 3.0) -> str:
         """Sends SCPI command and returns response (thread-safe via queue)."""
         with self._query_lock:
+            # Discard any stale lines left over from a previous timed-out command
+            while True:
+                try:
+                    item = self._scpi_queue.get_nowait()
+                    if item is _SENTINEL:
+                        self._scpi_queue.put(_SENTINEL)
+                        break
+                    logging.debug(f"Discarding stale SCPI data before {cmd!r}: {item!r}")
+                except _queue.Empty:
+                    break
             self.sock.sendall((cmd + '\r\n').encode())
             return self._collect_scpi_response(cmd, timeout)
 
