@@ -30,13 +30,16 @@ uccm_scpi_bridge.py
   └── NTP SHM Unit 0/1   ──────► ntpd / chrony
 ```
 
-### 1PPS-Quellen
+### 1PPS-Quellen (`--pps-source`)
 
-| Modus    | 1PPS-Quelle                  | SHM Unit 1  |
-|----------|------------------------------|-------------|
-| TCP      | TOD-Pakete (`TOD EN`)        | ~1 µs       |
-| Seriell  | DCD-Pin (steigende Flanke)   | ~1 µs       |
-| `--no-tod` | keine                      | inaktiv     |
+| `--pps-source` | TCP-Modus          | Serieller Modus        | SHM Unit 1 |
+|----------------|--------------------|------------------------|------------|
+| `auto`         | TOD-Pakete         | DCD-Pin                | ~1 µs      |
+| `tod`          | TOD-Pakete         | TOD-Pakete             | ~1 µs      |
+| `dcd`          | — (Warnung)        | DCD-Pin                | ~1 µs      |
+| `none`         | kein 1PPS          | kein 1PPS              | inaktiv    |
+
+`--no-tod` ist ein Alias fuer `--pps-source none` (Rueckwaertskompatibilitaet).
 
 **Hinweis:** Die Bridge schreibt 1PPS direkt in NTP SHM Unit 1 (bypassing gpsd).
 `gpsmon` zeigt daher PPS als N/A — ntpd/chrony erhalten die Daten trotzdem korrekt.
@@ -98,11 +101,14 @@ sudo systemctl start uccm-scpi-bridge
 # TCP-Modus mit NTP SHM (als root oder mit CAP_IPC_OWNER)
 sudo ./uccm_scpi_bridge.py --ntp-shm 192.168.1.100 2000
 
-# TCP-Modus ohne 1PPS (kein TOD-Datenstrom)
-sudo ./uccm_scpi_bridge.py --ntp-shm --no-tod 192.168.1.100 2000
+# TCP-Modus ohne 1PPS
+sudo ./uccm_scpi_bridge.py --ntp-shm --pps-source none 192.168.1.100 2000
 
-# Serieller Modus (1PPS via DCD-Pin)
+# Serieller Modus, 1PPS via DCD-Pin (Standard)
 sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --baud 9600
+
+# Serieller Modus, 1PPS via TOD-Datenstrom statt DCD
+sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --pps-source tod
 
 # Alle Optionen
 ./uccm_scpi_bridge.py --help
@@ -118,7 +124,8 @@ sudo ./uccm_scpi_bridge.py --ntp-shm --serial /dev/ttyUSB0 --baud 9600
 | `--baud`            | `9600`          | Baudrate fuer serielles Geraet                         |
 | `--pty`             | `/dev/uccm_gps` | PTY-Symlink-Pfad fuer gpsd                             |
 | `--ntp-shm`         | aus             | NTP SHM aktivieren (Unit 0=NMEA, Unit 1=1PPS)          |
-| `--no-tod`          | aus             | 1PPS-Quelle deaktivieren (kein SHM Unit 1)             |
+| `--pps-source`      | `auto`          | 1PPS-Quelle: `auto`\|`tod`\|`dcd`\|`none`             |
+| `--no-tod`          | aus             | Alias fuer `--pps-source none`                         |
 | `--reconnect-delay` | `5.0`           | Sekunden bis Reconnect                                 |
 | `--log-level`       | `INFO`          | DEBUG/INFO/WARNING/ERROR                               |
 
@@ -224,9 +231,9 @@ allen Azimuten = 0 als ungueltig ablehnen (SiRFstar-Workaround).
 | `GPS:SATellite:TRACking?` | `+prn,...,+prn` | alle 30 s |
 | `LED:GPSLock?` | `Locked` / `Unlocked` | alle 30 s |
 | `SYNChronization:TFOMerit?` | z.B. `1 ~ 10 nsec` | alle 30 s |
-| `TOD EN` / `TOD DI` | - | einmalig beim Start (TCP-Modus) |
+| `TOD EN` / `TOD DI` | - | einmalig beim Start (`--pps-source tod`) |
 
-### TOD-Pakete (1PPS, nur TCP-Modus)
+### TOD-Pakete (1PPS via `--pps-source tod`)
 
 44 Bytes binaer, hex-kodiert in ASCII, ein Paket pro Sekunde.
 Sync-Byte: `0xC5`. Byte 30 enthaelt die Sekunde im BCD-Format.
