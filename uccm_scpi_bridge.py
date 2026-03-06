@@ -422,14 +422,20 @@ class UccmScpiClient:
     # ------------------------------------------------------------------
 
     def _drain_scpi(self, timeout: float):
-        """Discards all pending SCPI lines for `timeout` seconds."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        """Discards all pending SCPI lines.
+
+        Stops as soon as the queue has been idle for 300 ms, but never
+        waits longer than `timeout` seconds in total.
+        """
+        deadline     = time.time() + timeout
+        idle_deadline = time.time() + 0.3
+        while time.time() < deadline and time.time() < idle_deadline:
             try:
-                item = self._scpi_queue.get(timeout=0.1)
+                item = self._scpi_queue.get(timeout=0.05)
                 if item is _SENTINEL:
                     self._scpi_queue.put(_SENTINEL)
-                    break
+                    return
+                idle_deadline = time.time() + 0.3  # reset on each item
             except _queue.Empty:
                 pass
 
@@ -845,7 +851,8 @@ class _WebHandler(BaseHTTPRequestHandler):
 
     # Class attributes set by WebServer
     status: 'BridgeStatus' = None
-    get_client = None  # Callable[[], Optional[UccmScpiClient]]
+    get_client      = None  # Callable[[], Optional[UccmScpiClient]]
+    make_log_client = None  # Callable[[], UccmScpiClient] – creates a dedicated log connection
 
     def _json_response(self, data, code: int = 200):
         body = json.dumps(data, default=str).encode()
@@ -855,17 +862,40 @@ class _WebHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _run_log_query(self, cmd: str, timeout: float) -> str:
+        """Execute a log SCPI command on a dedicated short-lived connection.
+
+        Using a separate connection keeps log operations completely
+        independent of the main polling client so TIME:STRing? continues
+        to run without interruption and NTP SHM timestamps stay current.
+        Falls back to the main client if the device refuses a second
+        connection.
+        """
+        try:
+            lc = self.make_log_client()
+            lc.connect()
+            try:
+                return lc.query(cmd, timeout=timeout)
+            finally:
+                lc.disconnect()
+        except OSError:
+            # Device may not accept a second TCP connection – fall back.
+            logging.debug("Log connection failed, falling back to main client")
+            main = self.get_client()
+            if main is None:
+                raise ConnectionError("Not connected")
+            return main.query(cmd, timeout=timeout)
+
     def do_GET(self):
         path = self.path.split('?')[0]
         if path == '/status':
             self._json_response(self.status.snapshot())
         elif path == '/log':
-            client = self.get_client()
-            if client is None:
+            if self.get_client() is None:
                 self._json_response({'error': 'Not connected'}, 503)
                 return
             try:
-                raw = client.query('DIAGNOSTIC:LOG:READ:ALL?', timeout=10.0)
+                raw = self._run_log_query('DIAGNOSTIC:LOG:READ:ALL?', timeout=10.0)
                 lines = [l for l in raw.splitlines()
                          if l.strip() and not l.startswith(('infohead[', 'head[', 'Log count ='))]
                 self._json_response({'lines': lines})
@@ -887,12 +917,11 @@ class _WebHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split('?')[0]
         if path == '/log/clear':
-            client = self.get_client()
-            if client is None:
+            if self.get_client() is None:
                 self._json_response({'error': 'Not connected'}, 503)
                 return
             try:
-                client.query('DIAGNOSTIC:LOG:CLEAR', timeout=5.0)
+                self._run_log_query('DIAGNOSTIC:LOG:CLEAR', timeout=5.0)
                 self._json_response({'ok': True})
             except Exception as e:
                 self._json_response({'error': str(e)}, 500)
@@ -906,17 +935,20 @@ class _WebHandler(BaseHTTPRequestHandler):
 class WebServer:
     """Starts an HTTP server in a daemon thread."""
 
-    def __init__(self, port: int, status: BridgeStatus, get_client):
-        self.port       = port
-        self.status     = status
-        self.get_client = get_client  # Callable[[], Optional[UccmScpiClient]]
+    def __init__(self, port: int, status: BridgeStatus, get_client,
+                 make_log_client=None):
+        self.port            = port
+        self.status          = status
+        self.get_client      = get_client       # Callable[[], Optional[UccmScpiClient]]
+        self.make_log_client = make_log_client  # Callable[[], UccmScpiClient]
         self._srv: Optional[HTTPServer] = None
 
     def start(self):
         # Derive handler class per instance so that status is set cleanly
         handler = type('_H', (_WebHandler,),
-                       {'status': self.status,
-                        'get_client': staticmethod(self.get_client)})
+                       {'status':          self.status,
+                        'get_client':      staticmethod(self.get_client),
+                        'make_log_client': staticmethod(self.make_log_client)})
         self._srv = HTTPServer(('', self.port), handler)
         t = threading.Thread(target=self._srv.serve_forever,
                              name='web', daemon=True)
@@ -980,8 +1012,11 @@ class UccmScpiBridge:
                     logging.warning(f"NTP SHM Unit {unit} not available: {e}")
 
         if self.web_port:
-            self._web = WebServer(self.web_port, self._status,
-                                  lambda: self._scpi_client)
+            self._web = WebServer(
+                self.web_port, self._status,
+                get_client=lambda: self._scpi_client,
+                make_log_client=lambda: UccmScpiClient(self.host, self.port),
+            )
             self._web.start()
 
         self._thread = threading.Thread(target=self._main_loop,
