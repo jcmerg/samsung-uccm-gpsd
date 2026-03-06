@@ -1224,7 +1224,9 @@ class UccmScpiBridge:
                     gps_sec -= timedelta(seconds=1)
                 else:
                     logging.warning(f"TOD BCD second {sec_bcd} far from "
-                                    f"recv_time second {gps_sec.second}, ignoring")
+                                    f"recv_time second {gps_sec.second} "
+                                    f"(delta={(sec_bcd - gps_sec.second) % 60}s, "
+                                    f"system clock may not be NTP-synchronized yet), ignoring")
                     bcd_ok = False
             self._status.update(last_pps_time=recv_time.isoformat())
             if self._shm1:
