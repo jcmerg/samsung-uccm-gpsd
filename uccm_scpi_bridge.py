@@ -1236,13 +1236,17 @@ class UccmScpiBridge:
             self._status.update(last_pps_time=recv_time.isoformat())
             if self._shm1:
                 # Skip SHM1 write if the packet is stale (BCD mismatch) or if
-                # recv_time is too far past gps_sec – a large delay (e.g. due
-                # to high system load causing Python scheduling latency) would
-                # produce an NTP offset that triggers a falseticker.
+                # recv_time is too far past gps_sec.  Python scheduling
+                # latency can delay the reader thread by hundreds of ms;
+                # that delay propagates directly into the NTP offset and can
+                # push it outside the range where ntpd agrees with SHM(0),
+                # causing both sources to be flagged as falsetickers.
+                # Normal TOD packet delivery takes 10–50 ms after the PPS
+                # edge; allow up to 200 ms as headroom for moderate load.
                 pps_delay = (recv_time - gps_sec).total_seconds()
                 if not bcd_ok:
                     logging.debug("TOD SHM1 skipped: stale BCD")
-                elif pps_delay > 0.990:
+                elif pps_delay > 0.200:
                     now = time.monotonic()
                     if now - self._last_delay_warn_time >= 30.0:
                         logging.warning(f"TOD recv delay {pps_delay:.3f}s too large, "
