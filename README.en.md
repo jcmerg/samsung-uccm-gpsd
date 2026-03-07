@@ -35,14 +35,20 @@ uccm_scpi_bridge.py
 
 | `--pps-source` | TCP mode           | Serial mode            | Typical SHM1 jitter |
 |----------------|--------------------|------------------------|---------------------|
-| `auto`         | TOD packets        | DCD pin                | TCP: 100–700 ms / DCD: ~1 ms |
+| `auto`         | TOD packets        | DCD pin                | TCP: 100–700 ms / DCD: < 2 ms (¹) |
 | `tod`          | TOD packets        | TOD packets            | TCP: 100–700 ms / serial: ~5 ms |
-| `dcd`          | — (warning)        | DCD pin                | ~1 ms               |
+| `dcd`          | — (warning)        | DCD pin                | < 2 ms (¹)          |
 | `none`         | no 1PPS            | no 1PPS                | inactive            |
 
-**Recommendation:** For PPS quality (< 10 ms jitter) use serial mode with `auto`
-(= DCD pin, 1 ms polling). TOD over TCP is subject to TCP network jitter and is
-not recommended as a primary PPS source for NTP.
+(¹) Only with FTDI latency timer = 1 ms (see section below). The default value
+of 16 ms adds up to 16 ms of additional jitter to DCD-based PPS measurements.
+
+**Recommendation:** For PPS quality (< 5 ms jitter) use serial mode with `auto`
+(= DCD pin, 1 ms polling) and FTDI low-latency mode. TOD over TCP is subject to
+variable network and OS scheduling jitter (100–700 ms) and is not recommended as
+a primary PPS source for NTP — when using TOD over TCP, compensate the NTP
+offset with `fudge time2` (ntpd) or `offset` (chrony) (typical value: read the
+SHM1 offset from `ntpq -p` / `chronyc sources` and enter it with the opposite sign).
 
 `--no-tod` is an alias for `--pps-source none` (backwards compatibility).
 
@@ -77,6 +83,39 @@ sudo systemctl enable --now ser2net
 
 If the serial port is directly connected to the bridge machine, ser2net is not
 needed — `--serial /dev/ttyUSB0` is sufficient.
+
+## FTDI USB-serial: low-latency mode (serial mode)
+
+When using an FTDI-based USB-serial adapter (e.g. `/dev/ttyUSB0`), the FTDI
+chip buffers incoming data for up to **16 ms** by default (latency timer) before
+transferring it to the host over USB. This also affects modem status events such
+as DCD edges and directly causes **up to 16 ms of jitter** on SHM Unit 1 when
+using `--pps-source dcd`.
+
+Set the latency timer to 1 ms (as root, not persistent):
+
+```bash
+echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+# Verify:
+cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+```
+
+Persistent via udev rule (`/etc/udev/rules.d/99-ftdi-latency.rules`):
+
+```
+ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
+```
+
+Activate the rule:
+
+```bash
+sudo udevadm control --reload-rules
+# Re-plug the adapter or:
+sudo udevadm trigger --subsystem-match=usb-serial
+```
+
+**Note:** The FTDI latency timer is only relevant for serial mode (`--serial`)
+with DCD-based 1PPS. It has no effect in TCP mode (TOD packets).
 
 ## Installation
 
@@ -176,17 +215,34 @@ sudo systemctl restart uccm-scpi-bridge
 be compensated with `fudge time1` — read the exact value from `ntpq -p`
 (column `offset`) and enter it with the opposite sign.
 
-**SHM1 (1PPS):** Jitter depends on the PPS source:
+**SHM1 (1PPS):** Jitter and systematic offset depend on the PPS source:
 
-| PPS source   | Jitter       | Recommendation |
-|--------------|--------------|----------------|
-| DCD serial   | ~1 ms        | Recommended as primary PPS source |
-| TOD serial   | ~5 ms        | Acceptable; UART transmission is deterministic |
-| TOD TCP      | 100–700 ms   | Not recommended as primary PPS source |
+| PPS source                    | Jitter     | Systematic offset | Recommendation |
+|-------------------------------|------------|-------------------|----------------|
+| DCD serial (FTDI latency=1)   | < 2 ms     | < 1 ms            | Recommended as primary PPS source |
+| DCD serial (FTDI latency=16)  | up to 16 ms | < 8 ms           | Acceptable, but adjust FTDI latency |
+| TOD serial                    | ~5 ms      | < 5 ms            | Acceptable; UART transmission is deterministic |
+| TOD TCP                       | 100–700 ms | 100–500 ms        | Not recommended as primary PPS source; set `fudge time2` / `offset` |
 
-The TOD over TCP jitter comes from TCP network buffering (Nagle algorithm,
-delayed ACKs) and variable device-side send timing. TOD over serial avoids
-network buffering; the remaining jitter is OS scheduling latency (~1–5 ms).
+For TOD TCP: read the measured SHM1 offset from `ntpq -p` or `chronyc sources`
+(column `offset`) and enter it with the **opposite sign** as `fudge time2` (ntpd)
+or `offset` (chrony). This compensates the fixed delay component.
+
+**Determining the offset value (TOD TCP):**
+
+```bash
+# ntpd: read offset column (in ms), flip sign, convert to seconds
+ntpq -p
+# Example: SHM(1) shows offset = -195.000 ms  →  time2 = +0.195
+
+# chrony: read Offset column
+chronyc sources -v
+# Example: SHM(1) shows -195 ms  →  offset = +0.195
+```
+
+This value is typically stable (< 20 ms variation) and only needs to be measured
+once. After restarting ntpd/chrony with the corrected value, SHM1 should show an
+offset < 20 ms and be accepted as a valid source.
 
 ### ntpd (`/etc/ntp.conf`)
 
@@ -199,6 +255,13 @@ fudge  127.127.28.0 refid GPS time1 0.3
 # 1PPS via TOD/DCD (SHM Unit 1) - fine accuracy (serial DCD/TOD recommended)
 server 127.127.28.1 minpoll 4 maxpoll 4 prefer
 fudge  127.127.28.1 refid PPS
+# time2: only needed for TOD TCP (systematic delay offset)
+# Value = measured SHM1 offset from "ntpq -p" with opposite sign, e.g.:
+# fudge  127.127.28.1 refid PPS time2 0.2
+
+# Recommendation: add a fallback time server to prevent clock drift
+# if GPS sources are marked as falsetickers:
+# server pool.ntp.org iburst
 ```
 
 ### chrony (`/etc/chrony.conf`)
@@ -210,6 +273,13 @@ refclock SHM 0 refid GPS precision 1e-1 offset 0.3 poll 4
 
 # 1PPS via TOD/DCD (SHM 1) - serial DCD or TOD recommended
 refclock SHM 1 refid PPS precision 1e-9 prefer poll 4
+# offset: only needed for TOD TCP (systematic delay offset)
+# Value = measured SHM1 offset from "chronyc sources" with opposite sign, e.g.:
+# refclock SHM 1 refid PPS precision 1e-9 prefer poll 4 offset 0.2
+
+# Recommendation: add a fallback time server to prevent clock drift
+# if GPS sources are marked as falsetickers:
+# pool pool.ntp.org iburst
 ```
 
 ## Web Interface
