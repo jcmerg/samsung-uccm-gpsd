@@ -282,6 +282,44 @@ refclock SHM 1 refid PPS precision 1e-9 prefer poll 4
 # pool pool.ntp.org iburst
 ```
 
+### Note: Raspberry Pi without hardware RTC
+
+Raspberry Pi systems without a hardware real-time clock (RTC) load a saved
+timestamp from `fake-hwclock` at boot. If that timestamp is far from the
+actual UTC time, NTP learns a wrong oscillator frequency and writes an
+invalid value to the drift file. On the next boot this value is loaded
+immediately — potentially causing the frequency correction to hit NTPd's
+hard limit of **±500 PPM**. In this state the system clock drifts
+uncontrollably, GPS and PPS sources show large offsets and are rejected as
+falsetickers.
+
+**Symptom:** `ntpq -c rv` shows `frequency=-500.0` (or `+500.0`).
+
+**Immediate fix:**
+
+```bash
+sudo systemctl stop ntpsec
+sudo truncate -s 0 /var/lib/ntpsec/ntp.drift   # or /var/lib/ntp/ntp.drift
+sudo systemctl start ntpsec
+# Wait 15–30 minutes for NTP to relearn the correct frequency
+```
+
+**Faster initial sync:** `tos minsane 1 minclock 1` together with `iburst`
+in `ntp.conf` allows NTP to synchronise from a single reachable server
+instead of waiting for a majority quorum:
+
+```
+tos minsane 1 minclock 1
+server ptbtime1.ptb.de iburst
+server ptbtime2.ptb.de iburst
+server ptbtime3.ptb.de iburst
+```
+
+**`fake-hwclock`:** On Raspberry Pi OS, `fake-hwclock` is registered in
+`cron.hourly` by default and saves the system time every hour. This limits
+the timestamp error at next boot to at most ~1 hour — well within NTP's
+ability to correct without producing a bad drift file.
+
 ## Web Interface
 
 With `--web-port 8080` the bridge starts a built-in HTTP server:
