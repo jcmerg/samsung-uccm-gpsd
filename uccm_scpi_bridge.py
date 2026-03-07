@@ -987,6 +987,7 @@ class UccmScpiBridge:
         self.use_shm         = args.ntp_shm
         # --no-tod is an alias for --pps-source none (backwards compatibility)
         self.pps_source      = 'none' if args.no_tod else args.pps_source
+        self.pps_fudge_sec   = args.pps_fudge_sec
         self.gps_utc_offset  = args.gps_utc_offset
         self.web_port        = args.web_port
         self.running         = False
@@ -1177,11 +1178,12 @@ class UccmScpiBridge:
 
                 # NTP SHM0: coarse UTC-second reference.
                 # utc_time = gps_time - gps_utc_offset = current UTC second.
-                # receiveTimeStamp = utc_time (the second boundary), not recv_time
-                # (SCPI response arrival), because the SCPI RTT (~500 ms) would
-                # otherwise produce a systematic negative offset in ntpd.
+                # receiveTimeStamp = recv_time (system clock at SCPI response
+                # arrival).  The resulting offset ≈ -(SCPI RTT) is a few hundred
+                # ms; ntpd will reject SHM0 as a falseticker when SHM1 and the
+                # network servers are present, which is the expected behavior.
                 if self._shm0:
-                    self._shm0.write(utc_time, utc_time, precision=-1)
+                    self._shm0.write(utc_time, recv_time, precision=-1)
                     logging.debug(f"NTP SHM0: {utc_time.isoformat()}")
 
             # Periodic queries (every 30th cycle)
@@ -1249,13 +1251,16 @@ class UccmScpiBridge:
                 # causing both sources to be flagged as falsetickers.
                 # TOD packet delivery via TCP typically takes 300–800 ms after
                 # the PPS edge (device firmware + network + OS scheduling).
-                # receiveTimeStamp = gps_sec (the second boundary), not recv_time
-                # (TCP arrival), because ntpd computes offset = clockTimeStamp −
-                # receiveTimeStamp.  Using recv_time would introduce a systematic
-                # −780 ms offset equal to the delivery delay.  gps_sec is already
-                # the system-clock reading at the second boundary (recv_time
-                # truncated), which is the correct "time the pulse arrived" as
-                # seen by the local clock.
+                #
+                # receiveTimeStamp must be an independent system-clock sample,
+                # not derived from gps_sec (which is itself from the local clock).
+                # ntpd computes: offset = clockTimeStamp − receiveTimeStamp.
+                # Without compensation: offset ≈ −pps_delay (systematic ~−780 ms).
+                # Compensation: receiveTimeStamp = recv_time − pps_fudge_sec,
+                # so offset ≈ gps_sec − (recv_time − pps_fudge_sec)
+                #            ≈ −pps_delay + pps_fudge_sec  →  ≈ 0 when tuned.
+                # Use --pps-fudge to set pps_fudge_sec (default 0.780 s).
+                #
                 # pps_delay is a belt-and-suspenders filter: reject packets that
                 # are so late they must belong to the previous second (>= 990 ms).
                 pps_delay = (recv_time - gps_sec).total_seconds()
@@ -1268,8 +1273,10 @@ class UccmScpiBridge:
                                         f"skipping SHM1 (packet too stale)")
                         self._last_delay_warn_time = now
                 else:
-                    self._shm1.write(gps_sec, gps_sec, precision=-9)
-                    logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
+                    recv_adj = recv_time - timedelta(seconds=self.pps_fudge_sec)
+                    self._shm1.write(gps_sec, recv_adj, precision=-9)
+                    logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}, "
+                                  f"recv_adj={recv_adj.isoformat()}")
 
         logging.info("TOD thread terminated")
 
@@ -1376,6 +1383,12 @@ def parse_args():
                         metavar='SEC')
     parser.add_argument('--ntp-shm', action='store_true',
                         help='Enable NTP SHM (Unit 0=NMEA, Unit 1=1PPS)')
+    parser.add_argument('--pps-fudge', dest='pps_fudge_sec', type=float,
+                        default=0.780, metavar='SEC',
+                        help='TOD delivery delay to subtract from receiveTimeStamp '
+                             'in NTP SHM1 (seconds). ntpd offset ≈ 0 when this '
+                             'matches the actual TOD packet delivery delay '
+                             '(typically 0.3–0.8 s, default 0.780).')
     parser.add_argument('--pps-source', default='auto',
                         choices=['auto', 'tod', 'dcd', 'none'],
                         help='1PPS source: auto|tod|dcd|none')
