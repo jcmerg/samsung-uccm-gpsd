@@ -1241,16 +1241,19 @@ class UccmScpiBridge:
                 # that delay propagates directly into the NTP offset and can
                 # push it outside the range where ntpd agrees with SHM(0),
                 # causing both sources to be flagged as falsetickers.
-                # Normal TOD packet delivery takes 10–50 ms after the PPS
-                # edge; allow up to 200 ms as headroom for moderate load.
+                # Normal TOD packet delivery via TCP takes 100–500 ms after
+                # the PPS edge due to network and OS scheduling jitter.
+                # Allow up to 700 ms to cover worst-case delivery; the
+                # resulting systematic offset must be compensated in the NTP
+                # configuration via fudge time2 (ntpd) or offset (chrony).
                 pps_delay = (recv_time - gps_sec).total_seconds()
                 if not bcd_ok:
                     logging.debug("TOD SHM1 skipped: stale BCD")
-                elif pps_delay > 0.200:
+                elif pps_delay > 0.700:
                     now = time.monotonic()
                     if now - self._last_delay_warn_time >= 30.0:
-                        logging.warning(f"TOD recv delay {pps_delay:.3f}s too large, "
-                                        f"skipping SHM1 (falseticker prevention)")
+                        logging.warning(f"TOD recv delay {pps_delay:.3f}s > 700 ms, "
+                                        f"skipping SHM1 (packet too stale)")
                         self._last_delay_warn_time = now
                 else:
                     self._shm1.write(gps_sec, recv_time, precision=-9)

@@ -35,14 +35,21 @@ uccm_scpi_bridge.py
 
 | `--pps-source` | TCP-Modus          | Serieller Modus        | Typischer Jitter SHM1 |
 |----------------|--------------------|------------------------|-----------------------|
-| `auto`         | TOD-Pakete         | DCD-Pin                | TCP: 100–700 ms / DCD: ~1 ms |
+| `auto`         | TOD-Pakete         | DCD-Pin                | TCP: 100–700 ms / DCD: < 2 ms (¹) |
 | `tod`          | TOD-Pakete         | TOD-Pakete             | TCP: 100–700 ms / seriell: ~5 ms |
-| `dcd`          | — (Warnung)        | DCD-Pin                | ~1 ms                 |
+| `dcd`          | — (Warnung)        | DCD-Pin                | < 2 ms (¹)            |
 | `none`         | kein 1PPS          | kein 1PPS              | inaktiv               |
 
-**Empfehlung:** Fuer PPS-Qualitaet (< 10 ms Jitter) seriellen Modus mit `auto`
-(= DCD-Pin, 1 ms Polling) verwenden. TOD ueber TCP unterliegt TCP-Netzwerkjitter
-und ist als primaere PPS-Quelle fuer NTP nicht empfehlenswert.
+(¹) Nur mit FTDI-Latency-Timer = 1 ms (siehe Abschnitt unten). Standardwert
+16 ms ergibt bis zu 16 ms zusaetzlichen Jitter auf DCD-basierten PPS-Messungen.
+
+**Empfehlung:** Fuer PPS-Qualitaet (< 5 ms Jitter) seriellen Modus mit `auto`
+(= DCD-Pin, 1 ms Polling) und FTDI-Low-Latency verwenden. TOD ueber TCP
+unterliegt variablem Netzwerk- und Scheduling-Jitter (100–700 ms) und ist als
+primaere PPS-Quelle fuer NTP nicht empfehlenswert — bei Verwendung von TOD
+TCP den NTP-Offset mit `fudge time2` (ntpd) bzw. `offset` (chrony) anpassen
+(typischer Wert: gemessenen SHM1-Offset aus `ntpq -p` / `chronyc sources`
+mit umgekehrtem Vorzeichen).
 
 `--no-tod` ist ein Alias fuer `--pps-source none` (Rueckwaertskompatibilitaet).
 
@@ -77,6 +84,40 @@ sudo systemctl enable --now ser2net
 
 Bei direkter Verbindung des seriellen Ports am Bridge-Rechner ist ser2net
 nicht noetig — `--serial /dev/ttyUSB0` genuegt.
+
+## FTDI USB-Serial: Low-Latency-Modus (serieller Modus)
+
+Bei Verwendung eines FTDI-basierten USB-Serial-Adapters (z.B. `/dev/ttyUSB0`)
+puffert der FTDI-Chip eingehende Daten standardmaessig fuer bis zu **16 ms**
+(Latency Timer), bevor er sie per USB an den Host uebertraegt. Das betrifft
+auch Modem-Status-Events wie DCD-Flanken und verursacht direkt **bis zu 16 ms
+Jitter** auf SHM Unit 1 beim `--pps-source dcd`-Modus.
+
+Latency Timer auf 1 ms setzen (als root, nicht persistent):
+
+```bash
+echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+# Kontrollieren:
+cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+```
+
+Persistent via udev-Regel (`/etc/udev/rules.d/99-ftdi-latency.rules`):
+
+```
+ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
+```
+
+Regel aktivieren:
+
+```bash
+sudo udevadm control --reload-rules
+# Adapter neu einstecken oder:
+sudo udevadm trigger --subsystem-match=usb-serial
+```
+
+**Hinweis:** Der FTDI-Latency-Timer ist nur fuer den seriellen Modus
+(`--serial`) mit DCD-basiertem 1PPS relevant. Im TCP-Modus (TOD-Pakete)
+spielt er keine Rolle.
 
 ## Installation
 
@@ -176,13 +217,35 @@ sudo systemctl restart uccm-scpi-bridge
 `fudge time1` kompensiert werden — den genauen Wert aus `ntpq -p` (Spalte
 `offset`) ablesen und mit umgekehrtem Vorzeichen eintragen.
 
-**SHM1 (1PPS):** Der Jitter haengt von der PPS-Quelle ab:
+**SHM1 (1PPS):** Der Jitter und der systematische Offset haengen von der PPS-Quelle ab:
 
-| PPS-Quelle | Jitter | Empfehlung |
-|------------|--------|------------|
-| DCD seriell | ~1 ms | Empfohlen als primaere PPS-Quelle |
-| TOD seriell | ~5 ms | Akzeptabel; UART-Uebertragung ist deterministisch |
-| TOD TCP | 100–700 ms | Nicht als primaere PPS-Quelle empfohlen |
+| PPS-Quelle | Jitter | System. Offset | Empfehlung |
+|------------|--------|----------------|------------|
+| DCD seriell (FTDI latency=1) | < 2 ms | < 1 ms | Empfohlen als primaere PPS-Quelle |
+| DCD seriell (FTDI latency=16) | bis 16 ms | < 8 ms | Akzeptabel, aber FTDI-Latency anpassen |
+| TOD seriell | ~5 ms | < 5 ms | Akzeptabel; UART-Uebertragung ist deterministisch |
+| TOD TCP | 100–700 ms | 100–500 ms | Nicht als primaere PPS-Quelle; `fudge time2` / `offset` eintragen |
+
+Bei TOD TCP: den gemessenen SHM1-Offset aus `ntpq -p` oder `chronyc sources`
+(Spalte `offset`) mit **umgekehrtem Vorzeichen** als `fudge time2` (ntpd) bzw.
+`offset` (chrony) eintragen. Damit kompensiert NTP den fixen Verzoegerungsanteil.
+
+**Offset-Wert ermitteln (TOD TCP):**
+
+```bash
+# ntpd: Offset in Spalte "offset" ablesen (in ms), Vorzeichen umkehren, in s umrechnen
+ntpq -p
+# Beispiel: SHM(1) zeigt offset = -195.000 ms  →  time2 = +0.195
+
+# chrony: Offset in Spalte "Offset" ablesen
+chronyc sources -v
+# Beispiel: SHM(1) zeigt -195 ms  →  offset = +0.195
+```
+
+Dieser Wert ist typischerweise stabil (< 20 ms Variation) und muss einmalig
+gemessen und eingetragen werden. Nach dem Neustart von ntpd/chrony mit dem
+korrigierten Wert sollte SHM1 einen Offset < 20 ms aufweisen und als valide
+Quelle akzeptiert werden.
 
 ### ntpd (`/etc/ntp.conf`)
 
@@ -195,6 +258,13 @@ fudge  127.127.28.0 refid GPS time1 0.3
 # 1PPS via TOD/DCD (SHM Unit 1) - Feingenauigkeit (DCD/TOD seriell empfohlen)
 server 127.127.28.1 minpoll 4 maxpoll 4 prefer
 fudge  127.127.28.1 refid PPS
+# time2: nur bei TOD TCP noetig (systematischer Delay-Offset)
+# Wert = gemessenen SHM1-Offset aus "ntpq -p" mit umgekehrtem Vorzeichen, z.B.:
+# fudge  127.127.28.1 refid PPS time2 0.2
+
+# Empfehlung: Fallback-Zeitserver eintragen, damit die Systemuhr nicht driftet
+# wenn GPS-Quellen als Falseticker markiert werden:
+# server pool.ntp.org iburst
 ```
 
 ### chrony (`/etc/chrony.conf`)
@@ -206,6 +276,13 @@ refclock SHM 0 refid GPS precision 1e-1 offset 0.3 poll 4
 
 # 1PPS via TOD/DCD (SHM 1) - DCD oder TOD seriell empfohlen
 refclock SHM 1 refid PPS precision 1e-9 prefer poll 4
+# offset: nur bei TOD TCP noetig (systematischer Delay-Offset)
+# Wert = gemessenen SHM1-Offset aus "chronyc sources" mit umgekehrtem Vorzeichen, z.B.:
+# refclock SHM 1 refid PPS precision 1e-9 prefer poll 4 offset 0.2
+
+# Empfehlung: Fallback-Zeitserver eintragen, damit die Systemuhr nicht driftet
+# wenn GPS-Quellen als Falseticker markiert werden:
+# pool pool.ntp.org iburst
 ```
 
 ## Web-Interface
