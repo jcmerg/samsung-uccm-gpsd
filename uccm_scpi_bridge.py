@@ -1176,12 +1176,12 @@ class UccmScpiBridge:
                     logging.debug(f"NMEA: {s.decode().strip()}")
 
                 # NTP SHM0: coarse UTC-second reference.
-                # utc_time = gps_time - gps_utc_offset ≈ current UTC second.
-                # At recv_time the offset becomes
-                #   offset = utc_time - recv_time ≈ -(SCPI RTT fraction)
-                # which is a small negative value (few hundred ms at most).
+                # utc_time = gps_time - gps_utc_offset = current UTC second.
+                # receiveTimeStamp = utc_time (the second boundary), not recv_time
+                # (SCPI response arrival), because the SCPI RTT (~500 ms) would
+                # otherwise produce a systematic negative offset in ntpd.
                 if self._shm0:
-                    self._shm0.write(utc_time, recv_time, precision=-1)
+                    self._shm0.write(utc_time, utc_time, precision=-1)
                     logging.debug(f"NTP SHM0: {utc_time.isoformat()}")
 
             # Periodic queries (every 30th cycle)
@@ -1249,11 +1249,15 @@ class UccmScpiBridge:
                 # causing both sources to be flagged as falsetickers.
                 # TOD packet delivery via TCP typically takes 300–800 ms after
                 # the PPS edge (device firmware + network + OS scheduling).
-                # The BCD second field is the primary guard against wrong-second
-                # packets; pps_delay is a belt-and-suspenders filter: reject
-                # only if the packet is so late it must belong to the previous
-                # second (>= 990 ms).  The resulting systematic offset must be
-                # compensated in NTP config via fudge time2 (ntpd) / offset (chrony).
+                # receiveTimeStamp = gps_sec (the second boundary), not recv_time
+                # (TCP arrival), because ntpd computes offset = clockTimeStamp −
+                # receiveTimeStamp.  Using recv_time would introduce a systematic
+                # −780 ms offset equal to the delivery delay.  gps_sec is already
+                # the system-clock reading at the second boundary (recv_time
+                # truncated), which is the correct "time the pulse arrived" as
+                # seen by the local clock.
+                # pps_delay is a belt-and-suspenders filter: reject packets that
+                # are so late they must belong to the previous second (>= 990 ms).
                 pps_delay = (recv_time - gps_sec).total_seconds()
                 if not bcd_ok:
                     logging.debug("TOD SHM1 skipped: stale BCD")
@@ -1264,7 +1268,7 @@ class UccmScpiBridge:
                                         f"skipping SHM1 (packet too stale)")
                         self._last_delay_warn_time = now
                 else:
-                    self._shm1.write(gps_sec, recv_time, precision=-9)
+                    self._shm1.write(gps_sec, gps_sec, precision=-9)
                     logging.debug(f"NTP SHM1 (1PPS): {gps_sec.isoformat()}")
 
         logging.info("TOD thread terminated")
