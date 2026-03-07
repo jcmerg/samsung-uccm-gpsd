@@ -987,6 +987,7 @@ class UccmScpiBridge:
         self.use_shm         = args.ntp_shm
         # --no-tod is an alias for --pps-source none (backwards compatibility)
         self.pps_source      = 'none' if args.no_tod else args.pps_source
+        self.gps_utc_offset  = args.gps_utc_offset
         self.web_port        = args.web_port
         self.running         = False
         self._pty: Optional[GpsdPty]       = None
@@ -1152,31 +1153,36 @@ class UccmScpiBridge:
                 time.sleep(0.5)
                 continue
 
+            # Convert GPS time to UTC.
+            # TIME:STRing? on this device returns GPS time (not UTC).
+            # GPS time is currently ahead of UTC by --gps-utc-offset seconds
+            # (18 leap seconds since 1980, unchanged since 2017).
+            # The device also returns the *current* GPS second (not next-second
+            # as originally assumed), so no additional -1 correction is needed.
+            utc_time = gps_time - timedelta(seconds=self.gps_utc_offset)
+
             # Generate NMEA only once per second
-            if gps_time.second != last_second:
-                last_second = gps_time.second
+            if utc_time.second != last_second:
+                last_second = utc_time.second
                 logging.debug(f"GPS time: {gps_time.isoformat()} "
+                              f"UTC: {utc_time.isoformat()} "
                               f"(received: {recv_time.isoformat()})")
-                self._status.update(last_gps_time=gps_time.isoformat())
+                self._status.update(last_gps_time=utc_time.isoformat())
 
                 # Generate NMEA and write to PTY
-                sentences = self._nmea.generate(gps_time)
+                sentences = self._nmea.generate(utc_time)
                 for s in sentences:
                     self._pty.write(s)
                     logging.debug(f"NMEA: {s.decode().strip()}")
 
-                # NTP SHM0: coarse GPS-second reference.
-                # TIME:STRing? returns the time for the NEXT GPS second
-                # (i.e. the time that will be valid at the upcoming PPS
-                # tick – standard GPS receiver behaviour).  At recv_time
-                # the *current* GPS second is therefore gps_time - 1 s.
-                # With that correction the SHM0 offset becomes
-                #   offset = (gps_time - 1) - recv_time ≈ -(SCPI RTT)
-                # which is a small, stable negative value (~-20 ms).
+                # NTP SHM0: coarse UTC-second reference.
+                # utc_time = gps_time - gps_utc_offset ≈ current UTC second.
+                # At recv_time the offset becomes
+                #   offset = utc_time - recv_time ≈ -(SCPI RTT fraction)
+                # which is a small negative value (few hundred ms at most).
                 if self._shm0:
-                    shm0_time = gps_time - timedelta(seconds=1)
-                    self._shm0.write(shm0_time, recv_time, precision=-1)
-                    logging.debug(f"NTP SHM0: {shm0_time.isoformat()}")
+                    self._shm0.write(utc_time, recv_time, precision=-1)
+                    logging.debug(f"NTP SHM0: {utc_time.isoformat()}")
 
             # Periodic queries (every 30th cycle)
             poll_cycle += 1
@@ -1371,6 +1377,11 @@ def parse_args():
                         help='Disable 1PPS (alias for --pps-source none)')
     parser.add_argument('--web-port', type=int, default=0, metavar='PORT',
                         help='HTTP status port (0 = disabled, e.g. 8080)')
+    parser.add_argument('--gps-utc-offset', type=int, default=18,
+                        metavar='SEC',
+                        help='GPS minus UTC offset in whole seconds (current leap seconds). '
+                             'Set to 18 if TIME:STRing? returns GPS time (default), '
+                             '1 if it returns UTC next-second, 0 if UTC current-second.')
     parser.add_argument('--log-level', default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = parser.parse_args()
